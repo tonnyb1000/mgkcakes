@@ -16,6 +16,7 @@ import {
   writeBatch,
 } from 'firebase/firestore';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { diffOrderInputAgainstSaved } from '../src/utils/reconcileOrder';
 
 const PROJECT_ID = 'cake-order-tracker-rules-test';
 
@@ -412,5 +413,77 @@ describe('Firestore security rules & emulator consistency', () => {
         })
       )
     );
+  });
+
+  it('reconciles uncertain new-order save against Firestore Emulator and applies edits without duplicating', async () => {
+    const staffDb = testEnv.authenticatedContext('staff-uid').firestore();
+    const orderId = 'ORD-20261118-RECON1';
+    const paymentId = 'PAY-20261118-RECON1';
+    const orderRef = doc(staffDb, 'orders', orderId);
+    const payRef = doc(staffDb, 'payments', paymentId);
+
+    // 1. Uncertain save already committed on the Firestore Emulator
+    await assertSucceeds(
+      runTransaction(staffDb, async (tx) => {
+        tx.set(payRef, makePayment({ paymentId, orderId, amountUgx: 60000 }));
+        tx.set(
+          orderRef,
+          makeOrder({
+            orderId,
+            description: 'Original sponge cake',
+            totalPriceUgx: 150000,
+            amountPaidUgx: 60000,
+            balanceUgx: 90000,
+            lastPaymentId: paymentId,
+          })
+        );
+      })
+    );
+
+    // 2. Client reconciles before retrying and detects edited description
+    const savedSnap = await getDoc(orderRef);
+    expect(savedSnap.exists()).toBe(true);
+    const savedOrder = savedSnap.data() as unknown as Parameters<typeof diffOrderInputAgainstSaved>[0];
+
+    const diffs = diffOrderInputAgainstSaved(savedOrder, {
+      customerName: 'Fictional Customer',
+      customerPhone: '0772000111',
+      orderDate: '2026-11-17',
+      pickupDate: '2026-11-20',
+      pickupTime: '14:00',
+      description: 'Edited sponge cake with berries',
+      design: 'Simple swirl',
+      colour: 'Blue & white',
+      icingType: 'buttercream',
+      icingOtherNote: '',
+      inscriptionOrDecoration: 'Happy Birthday',
+      size: '8 inch',
+      shape: 'Round',
+      tiers: '1',
+      totalPriceUgx: 150000,
+      amountPaidUgx: 60000,
+    });
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].field).toBe('Cake Description');
+
+    // 3. Apply edits via transactional updateOrder while preserving amountPaidUgx and lastPaymentId
+    await assertSucceeds(
+      runTransaction(staffDb, async (tx) => {
+        const snap = await tx.get(orderRef);
+        const existing = snap.data()!;
+        tx.update(orderRef, {
+          description: 'Edited sponge cake with berries',
+          amountPaidUgx: existing.amountPaidUgx,
+          balanceUgx: (existing.totalPriceUgx as number) - (existing.amountPaidUgx as number),
+          updatedAt: '2026-11-18T01:30:00+03:00',
+          updatedByUid: 'staff-uid',
+        });
+      })
+    );
+
+    const updatedSnap = await getDoc(orderRef);
+    expect(updatedSnap.data()!.description).toBe('Edited sponge cake with berries');
+    expect(updatedSnap.data()!.amountPaidUgx).toBe(60000);
+    expect(updatedSnap.data()!.lastPaymentId).toBe(paymentId);
   });
 });

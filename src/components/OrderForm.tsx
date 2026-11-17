@@ -1,4 +1,5 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { OrderReconcileConflictError } from '../services/orderRepository';
 import type {
   CakeOrder,
   CakeOrderInput,
@@ -19,6 +20,10 @@ import {
 } from '../utils/currency';
 import { formatDateDisplay, formatTimestampKampala, getKampalaToday } from '../utils/dateKampala';
 import { generateOrderId } from '../utils/orderId';
+import {
+  diffOrderInputAgainstSaved,
+  type OrderFieldDiff,
+} from '../utils/reconcileOrder';
 import { CakeTierBuilder } from './CakeTierBuilder';
 
 export const PENDING_NEW_ORDER_STORAGE_KEY = 'cake_order_pending_new_order_v1';
@@ -26,6 +31,7 @@ export const PENDING_NEW_ORDER_STORAGE_KEY = 'cake_order_pending_new_order_v1';
 interface PendingNewOrderDraft {
   orderId: string;
   paymentId: string;
+  saveAttempted?: boolean;
   form: CakeOrderInput;
 }
 
@@ -70,6 +76,8 @@ interface OrderFormProps {
     orderId?: string,
     newOrderIdempotency?: { orderId: string; paymentId: string }
   ) => Promise<void>;
+  onCheckExistingOrder?: (orderId: string) => Promise<CakeOrder | null>;
+  onResolveKeepSaved?: (existingOrder: CakeOrder) => void;
   onRecordPayment?: (
     orderId: string,
     amountUgx: number,
@@ -150,6 +158,8 @@ export const OrderForm: React.FC<OrderFormProps> = ({
   existingOrder,
   orderPayments = [],
   onSave,
+  onCheckExistingOrder,
+  onResolveKeepSaved,
   onRecordPayment,
   onCancel,
 }) => {
@@ -169,13 +179,35 @@ export const OrderForm: React.FC<OrderFormProps> = ({
           paymentId: generatePaymentId(getKampalaToday()),
         }
   );
+  const saveAttemptedRef = useRef<boolean>(Boolean(initialDraft?.saveAttempted));
   const [additionalPaymentInput, setAdditionalPaymentInput] = useState('');
   const [errors, setErrors] = useState<OrderValidationErrors>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [reconcileConflict, setReconcileConflict] = useState<{
+    existingOrder: CakeOrder;
+    differences: OrderFieldDiff[];
+  } | null>(null);
   const [paymentMessage, setPaymentMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [recordingPayment, setRecordingPayment] = useState(false);
   const pendingPaymentIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (isEditing || !initialDraft?.saveAttempted || !onCheckExistingOrder) return;
+    let cancelled = false;
+    void onCheckExistingOrder(initialDraft.orderId)
+      .then((found) => {
+        if (cancelled || !found) return;
+        const diffs = diffOrderInputAgainstSaved(found, initialDraft.form);
+        setReconcileConflict({ existingOrder: found, differences: diffs });
+      })
+      .catch(() => {
+        // Ignore transient offline check error; retry will reconcile again
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isEditing, initialDraft, onCheckExistingOrder]);
 
   const tierList = form.tierDetails ?? [];
   const calculatedTotal = useMemo(() => calculateTiersTotalUgx(tierList), [tierList]);
@@ -197,6 +229,7 @@ export const OrderForm: React.FC<OrderFormProps> = ({
         savePendingNewOrderDraft({
           orderId: pendingNewOrderIdsRef.current.orderId,
           paymentId: pendingNewOrderIdsRef.current.paymentId,
+          saveAttempted: saveAttemptedRef.current,
           form: next,
         });
       }
@@ -227,6 +260,7 @@ export const OrderForm: React.FC<OrderFormProps> = ({
         savePendingNewOrderDraft({
           orderId: pendingNewOrderIdsRef.current.orderId,
           paymentId: pendingNewOrderIdsRef.current.paymentId,
+          saveAttempted: saveAttemptedRef.current,
           form: next,
         });
       }
@@ -308,15 +342,34 @@ export const OrderForm: React.FC<OrderFormProps> = ({
     }
 
     if (!isEditing) {
+      saveAttemptedRef.current = true;
       savePendingNewOrderDraft({
         orderId: pendingNewOrderIdsRef.current.orderId,
         paymentId: pendingNewOrderIdsRef.current.paymentId,
+        saveAttempted: true,
         form: payload,
       });
     }
 
     setSaving(true);
     try {
+      // Reconcile uncertain order saves before retrying
+      if (!isEditing && onCheckExistingOrder) {
+        const existingOnServer = await onCheckExistingOrder(pendingNewOrderIdsRef.current.orderId);
+        if (existingOnServer) {
+          const diffs = diffOrderInputAgainstSaved(existingOnServer, payload);
+          if (diffs.length > 0) {
+            setReconcileConflict({ existingOrder: existingOnServer, differences: diffs });
+            return;
+          }
+          clearPendingNewOrderDraft();
+          if (onResolveKeepSaved) {
+            onResolveKeepSaved(existingOnServer);
+            return;
+          }
+        }
+      }
+
       await onSave(
         payload,
         existingOrder?.orderId,
@@ -326,10 +379,59 @@ export const OrderForm: React.FC<OrderFormProps> = ({
         clearPendingNewOrderDraft();
       }
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : 'Failed to save order.');
+      if (err instanceof OrderReconcileConflictError) {
+        setReconcileConflict({
+          existingOrder: err.existingOrder,
+          differences: err.differences,
+        });
+      } else {
+        setSubmitError(err instanceof Error ? err.message : 'Failed to save order.');
+      }
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleKeepSavedOrder = () => {
+    if (!reconcileConflict) return;
+    clearPendingNewOrderDraft();
+    const saved = reconcileConflict.existingOrder;
+    setReconcileConflict(null);
+    if (onResolveKeepSaved) {
+      onResolveKeepSaved(saved);
+    }
+  };
+
+  const handleApplyDraftOverSaved = async () => {
+    if (!reconcileConflict || saving) return;
+    setSubmitError(null);
+    const payload: CakeOrderInput = {
+      ...form,
+      totalPriceUgx: calculatedTotal,
+    };
+    setSaving(true);
+    try {
+      await onSave(payload, reconcileConflict.existingOrder.orderId);
+      clearPendingNewOrderDraft();
+      setReconcileConflict(null);
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : 'Failed to update saved order.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDiscardNewDraft = () => {
+    clearPendingNewOrderDraft();
+    saveAttemptedRef.current = false;
+    pendingNewOrderIdsRef.current = {
+      orderId: generateOrderId(getKampalaToday()),
+      paymentId: generatePaymentId(getKampalaToday()),
+    };
+    setReconcileConflict(null);
+    setSubmitError(null);
+    setErrors({});
+    setForm(buildInitialState(null));
   };
 
   return (
@@ -353,15 +455,79 @@ export const OrderForm: React.FC<OrderFormProps> = ({
           <button
             type="button"
             className="btn btn-secondary btn-sm"
-            onClick={() => {
-              if (!isEditing) clearPendingNewOrderDraft();
-              onCancel();
-            }}
+            onClick={onCancel}
           >
             Back
           </button>
         )}
       </div>
+
+      {!isEditing && initialDraft && (
+        <div className="notice notice-warning banner-dismiss" role="status">
+          <span>
+            Resuming draft <strong>{pendingNewOrderIdsRef.current.orderId}</strong>. Pending ID is
+            preserved if you navigate away.
+          </span>
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            onClick={handleDiscardNewDraft}
+          >
+            Discard Draft
+          </button>
+        </div>
+      )}
+
+      {reconcileConflict && (
+        <div className="notice notice-warning stack-md" role="alert">
+          <div>
+            <strong>
+              Order {reconcileConflict.existingOrder.orderId} was already saved on the server
+            </strong>
+            {reconcileConflict.differences.length > 0 ? (
+              <p>
+                Your local draft differs from the saved order. Choose whether to keep the saved
+                order or update it with your edits (the saved paid amount of{' '}
+                {formatUgx(reconcileConflict.existingOrder.amountPaidUgx)} is preserved):
+              </p>
+            ) : (
+              <p>Your draft matches the saved order. No duplicate will be created.</p>
+            )}
+          </div>
+
+          {reconcileConflict.differences.length > 0 && (
+            <ul className="reconcile-diff-list">
+              {reconcileConflict.differences.map((d) => (
+                <li key={d.field}>
+                  <strong>{d.field}:</strong> Saved <code>{d.savedValue}</code> vs. Your Edit{' '}
+                  <code>{d.draftValue}</code>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <div className="header-actions">
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              onClick={handleKeepSavedOrder}
+              disabled={saving}
+            >
+              Keep Saved Order
+            </button>
+            {reconcileConflict.differences.length > 0 && (
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                onClick={handleApplyDraftOverSaved}
+                disabled={saving}
+              >
+                {saving ? 'Updating…' : 'Update Saved Order with My Edits'}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {submitError && (
         <div className="notice notice-error" role="alert">
@@ -678,10 +844,7 @@ export const OrderForm: React.FC<OrderFormProps> = ({
             <button
               type="button"
               className="btn btn-secondary"
-              onClick={() => {
-                if (!isEditing) clearPendingNewOrderDraft();
-                onCancel();
-              }}
+              onClick={onCancel}
             >
               Cancel
             </button>

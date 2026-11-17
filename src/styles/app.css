@@ -1238,6 +1238,15 @@ code {
   padding-top: 0.65rem;
 }
 
+.reconcile-diff-list {
+  margin: 0;
+  padding-left: 1.2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.88rem;
+}
+
 @media (max-width: 720px) {
   .collections-summary-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));

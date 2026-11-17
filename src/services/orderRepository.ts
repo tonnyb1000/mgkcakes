@@ -28,7 +28,25 @@ import {
 import { calculateBalanceUgx, validateOrderInput } from '../utils/currency';
 import { getKampalaTimeNow, getKampalaToday } from '../utils/dateKampala';
 import { generateOrderId } from '../utils/orderId';
+import {
+  diffOrderInputAgainstSaved,
+  type OrderFieldDiff,
+} from '../utils/reconcileOrder';
 import { getFirebaseServices } from './firebaseClient';
+
+export class OrderReconcileConflictError extends Error {
+  readonly existingOrder: CakeOrder;
+  readonly differences: OrderFieldDiff[];
+
+  constructor(existingOrder: CakeOrder, differences: OrderFieldDiff[]) {
+    super(
+      `Order ${existingOrder.orderId} already exists on the server with ${differences.length} difference(s).`
+    );
+    this.name = 'OrderReconcileConflictError';
+    this.existingOrder = existingOrder;
+    this.differences = differences;
+  }
+}
 
 export interface OrderRepository {
   readonly configured: boolean;
@@ -36,6 +54,7 @@ export interface OrderRepository {
   signIn(email: string, password: string): Promise<StaffUser>;
   signOut(): Promise<void>;
   listOrders(currentUser: StaffUser | null): Promise<CakeOrder[]>;
+  getOrderById(orderId: string, currentUser: StaffUser | null): Promise<CakeOrder | null>;
   listPayments(currentUser: StaffUser | null): Promise<PaymentTransaction[]>;
   createOrder(
     input: CakeOrderInput,
@@ -95,6 +114,10 @@ export class UnconfiguredOrderRepository implements OrderRepository {
   async signOut(): Promise<void> {}
 
   async listOrders(): Promise<CakeOrder[]> {
+    throw new Error('Firebase is not configured. Access is blocked.');
+  }
+
+  async getOrderById(): Promise<CakeOrder | null> {
     throw new Error('Firebase is not configured. Access is blocked.');
   }
 
@@ -210,6 +233,13 @@ export class FirestoreOrderRepository implements OrderRepository {
     return snap.docs.map((d) => d.data() as CakeOrder);
   }
 
+  async getOrderById(orderId: string, currentUser: StaffUser | null): Promise<CakeOrder | null> {
+    assertAuthorizedStaff(currentUser);
+    const { db } = this.getServices();
+    const snap = await getDoc(doc(db, 'orders', orderId));
+    return snap.exists() ? (snap.data() as CakeOrder) : null;
+  }
+
   async listPayments(currentUser: StaffUser | null): Promise<PaymentTransaction[]> {
     assertAuthorizedStaff(currentUser);
     const { db } = this.getServices();
@@ -278,7 +308,12 @@ export class FirestoreOrderRepository implements OrderRepository {
     return runTransaction(db, async (tx) => {
       const existingOrderSnap = await tx.get(orderRef);
       if (existingOrderSnap.exists()) {
-        return existingOrderSnap.data() as CakeOrder;
+        const existingOrder = existingOrderSnap.data() as CakeOrder;
+        const differences = diffOrderInputAgainstSaved(existingOrder, input);
+        if (differences.length > 0) {
+          throw new OrderReconcileConflictError(existingOrder, differences);
+        }
+        return existingOrder;
       }
 
       if (paid > 0 && paymentId) {

@@ -215,6 +215,20 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
           ) : activeTab === 'new' ? (
             <OrderForm
               onSave={handleSaveOrder}
+              onCheckExistingOrder={(orderId) => repo.getOrderById(orderId, user)}
+              onResolveKeepSaved={async (savedOrder) => {
+                setOrders((prev) =>
+                  prev.some((o) => o.orderId === savedOrder.orderId)
+                    ? prev.map((o) => (o.orderId === savedOrder.orderId ? savedOrder : o))
+                    : [savedOrder, ...prev]
+                );
+                if (savedOrder.amountPaidUgx > 0) {
+                  const latestPayments = await repo.listPayments(user);
+                  setPayments(latestPayments);
+                }
+                setActiveTab('orders');
+                setBannerMessage(`Reconciled existing order ${savedOrder.orderId}.`);
+              }}
               onCancel={() => handleTabChange('orders')}
             />
           ) : activeTab === 'collections' ? (

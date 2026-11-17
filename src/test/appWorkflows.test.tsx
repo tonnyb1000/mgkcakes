@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { App } from '../App';
 import {
+  OrderReconcileConflictError,
   UnconfiguredOrderRepository,
   type OrderRepository,
 } from '../services/orderRepository';
@@ -18,6 +19,7 @@ import {
   generatePaymentId,
   validateWalkInSale,
 } from '../utils/collections';
+import { diffOrderInputAgainstSaved } from '../utils/reconcileOrder';
 import { calculateBalanceUgx, validateOrderInput } from '../utils/currency';
 import {
   addDaysToDateString,
@@ -73,6 +75,11 @@ class TestMemoryOrderRepository implements OrderRepository {
     return [...this.orders];
   }
 
+  async getOrderById(orderId: string, user: StaffUser | null): Promise<CakeOrder | null> {
+    if (!user) throw new Error('Access denied');
+    return this.orders.find((o) => o.orderId === orderId) ?? null;
+  }
+
   async listPayments(user: StaffUser | null): Promise<PaymentTransaction[]> {
     if (!user) throw new Error('Access denied');
     return [...this.payments];
@@ -91,6 +98,10 @@ class TestMemoryOrderRepository implements OrderRepository {
     const orderId = idempotency?.orderId || generateOrderId(input.orderDate);
     const existing = this.orders.find((o) => o.orderId === orderId);
     if (existing) {
+      const diffs = diffOrderInputAgainstSaved(existing, input);
+      if (diffs.length > 0) {
+        throw new OrderReconcileConflictError(existing, diffs);
+      }
       return existing;
     }
 
@@ -637,6 +648,7 @@ describe('Cake Order Tracker workflows & access control', () => {
       signIn: (e, p) => baseRepo.signIn(e, p),
       signOut: () => baseRepo.signOut(),
       listOrders: (u) => baseRepo.listOrders(u),
+      getOrderById: (id, u) => baseRepo.getOrderById(id, u),
       listPayments: (u) => baseRepo.listPayments(u),
       updateOrder: (id, inp, u) => baseRepo.updateOrder(id, inp, u),
       updatePickupStatus: (id, st, u) => baseRepo.updatePickupStatus(id, st, u),
@@ -697,5 +709,78 @@ describe('Cake Order Tracker workflows & access control', () => {
     );
     expect(matchingPayments).toHaveLength(1);
     expect(matchingPayments[0].amountUgx).toBe(30000);
+  });
+
+  it('preserves pending ID when navigating away and warns on differences when reconciling uncertain save', async () => {
+    const user = userEvent.setup();
+    const baseRepo = new TestMemoryOrderRepository(makeTestOrders());
+
+    let failOnce = true;
+    const flakyRepo: OrderRepository = {
+      configured: true,
+      subscribeAuth: (cb) => baseRepo.subscribeAuth(cb),
+      signIn: (e, p) => baseRepo.signIn(e, p),
+      signOut: () => baseRepo.signOut(),
+      listOrders: (u) => baseRepo.listOrders(u),
+      getOrderById: (id, u) => baseRepo.getOrderById(id, u),
+      listPayments: (u) => baseRepo.listPayments(u),
+      updateOrder: (id, inp, u) => baseRepo.updateOrder(id, inp, u),
+      updatePickupStatus: (id, st, u) => baseRepo.updatePickupStatus(id, st, u),
+      recordOrderPayment: (id, amt, u, pid) => baseRepo.recordOrderPayment(id, amt, u, pid),
+      recordWalkInSale: (inp, u, pid) => baseRepo.recordWalkInSale(inp, u, pid),
+      deleteArchivedOrders: (ids, u) => baseRepo.deleteArchivedOrders(ids, u),
+      async createOrder(input, staffUser, idempotency) {
+        const created = await baseRepo.createOrder(input, staffUser, idempotency);
+        if (failOnce) {
+          failOnce = false;
+          throw new Error('Uncertain timeout after commit');
+        }
+        return created;
+      },
+    };
+
+    render(<App repository={flakyRepo} />);
+    await signInAs(user, 'staff@shop.example');
+    await user.click(await screen.findByRole('button', { name: /New Order/i }));
+
+    await user.type(screen.getByLabelText(/Customer Name/i), 'Reconcile Customer');
+    await user.type(screen.getByLabelText(/Phone Number/i), '0772888777');
+    await user.type(screen.getByLabelText(/Cake Description/i), 'Original vanilla cake');
+    const tier1Quick = screen.getByRole('group', { name: /Quick prices for Tier 1/i });
+    await user.click(within(tier1Quick).getByRole('button', { name: '100,000' }));
+
+    // Save commits on server, then throws uncertain timeout
+    await user.click(screen.getByRole('button', { name: /Save Order/i }));
+    expect(await screen.findByText(/Uncertain timeout after commit/i)).toBeInTheDocument();
+
+    // Navigate away via Back, then return to New Order: pending ID & draft are preserved
+    await user.click(screen.getByRole('button', { name: /^Back$/i }));
+    await user.click((await screen.findAllByRole('button', { name: /New Order/i }))[0]);
+    expect(await screen.findByText(/Resuming draft ORD-/i)).toBeInTheDocument();
+
+    // Edit description before retrying -> reconciliation warns about difference
+    const descInput = screen.getByLabelText(/Cake Description/i);
+    await user.clear(descInput);
+    await user.type(descInput, 'Updated vanilla berry cake');
+    await user.click(screen.getByRole('button', { name: /Save Order/i }));
+
+    expect(await screen.findByText(/was already saved on the server/i)).toBeInTheDocument();
+    expect(screen.getByText(/Cake Description:/i)).toBeInTheDocument();
+    expect(screen.getByText(/Original vanilla cake/i)).toBeInTheDocument();
+    expect(screen.getByText(/Updated vanilla berry cake/i)).toBeInTheDocument();
+
+    // Apply edits to the saved order without creating a duplicate
+    await user.click(screen.getByRole('button', { name: /Update Saved Order with My Edits/i }));
+    expect(await screen.findByText('Updated vanilla berry cake')).toBeInTheDocument();
+
+    const staffUser: StaffUser = {
+      uid: 'staff-1',
+      email: 'staff@shop.example',
+      displayName: 'Staff User',
+      role: 'staff',
+      active: true,
+    };
+    const allOrders = await baseRepo.listOrders(staffUser);
+    expect(allOrders.filter((o) => o.customerName === 'Reconcile Customer')).toHaveLength(1);
   });
 });
