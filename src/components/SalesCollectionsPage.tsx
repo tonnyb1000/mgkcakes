@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import type {
   CakeOrder,
   PaymentTransaction,
@@ -59,6 +59,7 @@ export const SalesCollectionsPage: React.FC<SalesCollectionsPageProps> = ({
   const [formErrors, setFormErrors] = useState<WalkInValidationErrors>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const pendingSaleIdRef = useRef<string | null>(null);
 
   const summary = useMemo(
     () => summarizeDailyCollections(payments, selectedDate),
@@ -97,8 +98,11 @@ export const SalesCollectionsPage: React.FC<SalesCollectionsPageProps> = ({
 
     setSaving(true);
     try {
-      const paymentId = generatePaymentId(saleDate);
-      await onRecordWalkInSale(input, paymentId);
+      if (!pendingSaleIdRef.current) {
+        pendingSaleIdRef.current = generatePaymentId(saleDate);
+      }
+      await onRecordWalkInSale(input, pendingSaleIdRef.current);
+      pendingSaleIdRef.current = null;
       setDescription('');
       setAmountRaw('');
       setFormErrors({});

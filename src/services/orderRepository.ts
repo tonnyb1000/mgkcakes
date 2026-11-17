@@ -1,14 +1,11 @@
 import {
   collection,
-  deleteDoc,
   doc,
   getDoc,
   getDocs,
   orderBy,
   query,
   runTransaction,
-  updateDoc,
-  writeBatch,
 } from 'firebase/firestore';
 import {
   onAuthStateChanged,
@@ -68,13 +65,6 @@ export interface OrderRepository {
 function assertAuthorizedStaff(user: StaffUser | null): asserts user is StaffUser {
   if (!user || !user.active || (user.role !== 'staff' && user.role !== 'owner')) {
     throw new Error('Access denied: You must be signed in as authorised staff.');
-  }
-}
-
-function assertOwner(user: StaffUser | null): asserts user is StaffUser {
-  assertAuthorizedStaff(user);
-  if (user.role !== 'owner') {
-    throw new Error('Access denied: Only the shop owner can delete archived orders.');
   }
 }
 
@@ -224,16 +214,23 @@ export class FirestoreOrderRepository implements OrderRepository {
     return snap.docs.map((d) => d.data() as PaymentTransaction);
   }
 
-  async createOrder(input: CakeOrderInput, currentUser: StaffUser | null): Promise<CakeOrder> {
+  async createOrder(
+    input: CakeOrderInput,
+    currentUser: StaffUser | null,
+    idempotency?: { orderId?: string; paymentId?: string }
+  ): Promise<CakeOrder> {
     assertAuthorizedStaff(currentUser);
     assertValidOrder(input);
     const { db } = this.getServices();
 
-    const orderId = generateOrderId(input.orderDate);
+    const orderId = idempotency?.orderId || generateOrderId(input.orderDate);
     const now = new Date();
     const nowIso = now.toISOString();
     const total = Math.round(input.totalPriceUgx);
     const paid = Math.round(input.amountPaidUgx);
+    const receivedDate = getKampalaToday(now);
+    const receivedTime = getKampalaTimeNow(now);
+    const paymentId = paid > 0 ? idempotency?.paymentId || generatePaymentId(receivedDate) : '';
 
     const order: CakeOrder = {
       orderId,
@@ -263,6 +260,7 @@ export class FirestoreOrderRepository implements OrderRepository {
       totalPriceUgx: total,
       amountPaidUgx: paid,
       balanceUgx: calculateBalanceUgx(total, paid),
+      ...(paymentId ? { lastPaymentId: paymentId } : {}),
       pickupStatus: input.pickupStatus ?? 'waiting',
       createdAt: nowIso,
       updatedAt: nowIso,
@@ -272,32 +270,39 @@ export class FirestoreOrderRepository implements OrderRepository {
       updatedByEmail: currentUser.email,
     };
 
-    const batch = writeBatch(db);
-    batch.set(doc(db, 'orders', orderId), order);
+    const orderRef = doc(db, 'orders', orderId);
+    return runTransaction(db, async (tx) => {
+      const existingOrderSnap = await tx.get(orderRef);
+      if (existingOrderSnap.exists()) {
+        return existingOrderSnap.data() as CakeOrder;
+      }
 
-    if (paid > 0) {
-      const receivedDate = getKampalaToday(now);
-      const receivedTime = getKampalaTimeNow(now);
-      const paymentId = generatePaymentId(receivedDate);
-      const depositTx: PaymentTransaction = {
-        paymentId,
-        kind: 'order_deposit',
-        orderId,
-        customerName: order.customerName,
-        description: order.description,
-        amountUgx: paid,
-        receivedDate,
-        receivedTime,
-        receivedAt: nowIso,
-        recordedByUid: currentUser.uid,
-        recordedByEmail: currentUser.email,
-        recordedByName: currentUser.displayName,
-      };
-      batch.set(doc(db, 'payments', paymentId), depositTx);
-    }
+      if (paid > 0 && paymentId) {
+        const paymentRef = doc(db, 'payments', paymentId);
+        const existingPaySnap = await tx.get(paymentRef);
+        if (existingPaySnap.exists()) {
+          throw new Error('Duplicate deposit payment ID detected. Please retry.');
+        }
+        const depositTx: PaymentTransaction = {
+          paymentId,
+          kind: 'order_deposit',
+          orderId,
+          customerName: order.customerName,
+          description: order.description,
+          amountUgx: paid,
+          receivedDate,
+          receivedTime,
+          receivedAt: nowIso,
+          recordedByUid: currentUser.uid,
+          recordedByEmail: currentUser.email,
+          recordedByName: currentUser.displayName,
+        };
+        tx.set(paymentRef, depositTx);
+      }
 
-    await batch.commit();
-    return order;
+      tx.set(orderRef, order);
+      return order;
+    });
   }
 
   async updateOrder(
@@ -310,54 +315,57 @@ export class FirestoreOrderRepository implements OrderRepository {
     const { db } = this.getServices();
 
     const ref = doc(db, 'orders', orderId);
-    const existingSnap = await getDoc(ref);
-    if (!existingSnap.exists()) {
-      throw new Error(`Order ${orderId} was not found.`);
-    }
-    const existing = existingSnap.data() as CakeOrder;
     const total = Math.round(input.totalPriceUgx);
-    // Preserve recorded amountPaidUgx; payments must be added via recordOrderPayment.
-    const paid = existing.amountPaidUgx;
-    if (total < paid) {
-      throw new Error('Total price cannot be less than the amount already paid.');
-    }
 
-    const updated: CakeOrder = {
-      ...existing,
-      customerName: input.customerName.trim(),
-      customerPhone: input.customerPhone.trim(),
-      orderDate: input.orderDate,
-      pickupDate: input.pickupDate,
-      pickupTime: input.pickupTime.trim(),
-      description: input.description.trim(),
-      design: input.design.trim(),
-      colour: input.colour.trim(),
-      icingType: input.icingType,
-      icingOtherNote: input.icingType === 'other' ? (input.icingOtherNote ?? '').trim() : '',
-      inscriptionOrDecoration: input.inscriptionOrDecoration.trim(),
-      size: input.size.trim(),
-      shape: input.shape.trim(),
-      tiers: input.tiers.trim(),
-      ...(input.tierDetails && input.tierDetails.length > 0
-        ? {
-            tierDetails: input.tierDetails.map((t, idx) => ({
-              tierNumber: idx + 1,
-              shape: t.shape.trim(),
-              priceUgx: Math.round(t.priceUgx),
-            })),
-          }
-        : {}),
-      totalPriceUgx: total,
-      amountPaidUgx: paid,
-      balanceUgx: calculateBalanceUgx(total, paid),
-      pickupStatus: input.pickupStatus ?? existing.pickupStatus,
-      updatedAt: new Date().toISOString(),
-      updatedByUid: currentUser.uid,
-      updatedByEmail: currentUser.email,
-    };
+    return runTransaction(db, async (tx) => {
+      const existingSnap = await tx.get(ref);
+      if (!existingSnap.exists()) {
+        throw new Error(`Order ${orderId} was not found.`);
+      }
+      const existing = existingSnap.data() as CakeOrder;
+      // Preserve latest server amountPaidUgx & lastPaymentId under concurrent edits.
+      const paid = existing.amountPaidUgx;
+      if (total < paid) {
+        throw new Error('Total price cannot be less than the amount already paid.');
+      }
 
-    await updateDoc(ref, { ...updated });
-    return updated;
+      const updated: CakeOrder = {
+        ...existing,
+        customerName: input.customerName.trim(),
+        customerPhone: input.customerPhone.trim(),
+        orderDate: input.orderDate,
+        pickupDate: input.pickupDate,
+        pickupTime: input.pickupTime.trim(),
+        description: input.description.trim(),
+        design: input.design.trim(),
+        colour: input.colour.trim(),
+        icingType: input.icingType,
+        icingOtherNote: input.icingType === 'other' ? (input.icingOtherNote ?? '').trim() : '',
+        inscriptionOrDecoration: input.inscriptionOrDecoration.trim(),
+        size: input.size.trim(),
+        shape: input.shape.trim(),
+        tiers: input.tiers.trim(),
+        ...(input.tierDetails && input.tierDetails.length > 0
+          ? {
+              tierDetails: input.tierDetails.map((t, idx) => ({
+                tierNumber: idx + 1,
+                shape: t.shape.trim(),
+                priceUgx: Math.round(t.priceUgx),
+              })),
+            }
+          : {}),
+        totalPriceUgx: total,
+        amountPaidUgx: paid,
+        balanceUgx: calculateBalanceUgx(total, paid),
+        pickupStatus: input.pickupStatus ?? existing.pickupStatus,
+        updatedAt: new Date().toISOString(),
+        updatedByUid: currentUser.uid,
+        updatedByEmail: currentUser.email,
+      };
+
+      tx.update(ref, { ...updated });
+      return updated;
+    });
   }
 
   async updatePickupStatus(
@@ -368,27 +376,30 @@ export class FirestoreOrderRepository implements OrderRepository {
     assertAuthorizedStaff(currentUser);
     const { db } = this.getServices();
     const ref = doc(db, 'orders', orderId);
-    const existingSnap = await getDoc(ref);
-    if (!existingSnap.exists()) {
-      throw new Error(`Order ${orderId} was not found.`);
-    }
-    const existing = existingSnap.data() as CakeOrder;
-    const updatedAt = new Date().toISOString();
 
-    await updateDoc(ref, {
-      pickupStatus: status,
-      updatedAt,
-      updatedByUid: currentUser.uid,
-      updatedByEmail: currentUser.email,
+    return runTransaction(db, async (tx) => {
+      const existingSnap = await tx.get(ref);
+      if (!existingSnap.exists()) {
+        throw new Error(`Order ${orderId} was not found.`);
+      }
+      const existing = existingSnap.data() as CakeOrder;
+      const updatedAt = new Date().toISOString();
+
+      tx.update(ref, {
+        pickupStatus: status,
+        updatedAt,
+        updatedByUid: currentUser.uid,
+        updatedByEmail: currentUser.email,
+      });
+
+      return {
+        ...existing,
+        pickupStatus: status,
+        updatedAt,
+        updatedByUid: currentUser.uid,
+        updatedByEmail: currentUser.email,
+      };
     });
-
-    return {
-      ...existing,
-      pickupStatus: status,
-      updatedAt,
-      updatedByUid: currentUser.uid,
-      updatedByEmail: currentUser.email,
-    };
   }
 
   async recordOrderPayment(
@@ -414,16 +425,22 @@ export class FirestoreOrderRepository implements OrderRepository {
 
     return runTransaction(db, async (tx) => {
       const existingPaySnap = await tx.get(paymentRef);
-      if (existingPaySnap.exists()) {
-        throw new Error('This payment has already been recorded (duplicate prevented).');
-      }
-
       const orderSnap = await tx.get(orderRef);
       if (!orderSnap.exists()) {
         throw new Error(`Order ${orderId} was not found.`);
       }
 
       const existing = orderSnap.data() as CakeOrder;
+
+      if (existingPaySnap.exists()) {
+        const existingPay = existingPaySnap.data() as PaymentTransaction;
+        if (existingPay.orderId === orderId && existingPay.amountUgx === cleanAmount) {
+          // Idempotent retry: payment was already committed on the server.
+          return { order: existing, payment: existingPay };
+        }
+        throw new Error('This payment ID is already in use for a different payment.');
+      }
+
       const nextPaid = existing.amountPaidUgx + cleanAmount;
       if (nextPaid > existing.totalPriceUgx) {
         throw new Error(
@@ -436,6 +453,7 @@ export class FirestoreOrderRepository implements OrderRepository {
         ...existing,
         amountPaidUgx: nextPaid,
         balanceUgx: nextBalance,
+        lastPaymentId: paymentId,
         updatedAt: nowIso,
         updatedByUid: currentUser.uid,
         updatedByEmail: currentUser.email,
@@ -460,6 +478,7 @@ export class FirestoreOrderRepository implements OrderRepository {
       tx.update(orderRef, {
         amountPaidUgx: nextPaid,
         balanceUgx: nextBalance,
+        lastPaymentId: paymentId,
         updatedAt: nowIso,
         updatedByUid: currentUser.uid,
         updatedByEmail: currentUser.email,
@@ -501,38 +520,28 @@ export class FirestoreOrderRepository implements OrderRepository {
       recordedByName: currentUser.displayName,
     };
 
-    await runTransaction(db, async (tx) => {
+    return runTransaction(db, async (tx) => {
       const existing = await tx.get(paymentRef);
       if (existing.exists()) {
-        throw new Error('This walk-in sale has already been recorded (duplicate prevented).');
+        const existingSale = existing.data() as PaymentTransaction;
+        if (
+          existingSale.kind === 'walk_in' &&
+          existingSale.amountUgx === sale.amountUgx &&
+          existingSale.description === sale.description
+        ) {
+          // Idempotent retry: walk-in sale was already committed.
+          return existingSale;
+        }
+        throw new Error('This walk-in sale ID is already in use.');
       }
       tx.set(paymentRef, sale);
+      return sale;
     });
-
-    return sale;
   }
 
-  async deleteArchivedOrders(orderIds: string[], currentUser: StaffUser | null): Promise<number> {
-    assertOwner(currentUser);
-    const { db } = this.getServices();
-    if (orderIds.length === 0) return 0;
-
-    if (orderIds.length === 1) {
-      await deleteDoc(doc(db, 'orders', orderIds[0]));
-      return 1;
-    }
-
-    let deleted = 0;
-    for (let i = 0; i < orderIds.length; i += 450) {
-      const chunk = orderIds.slice(i, i + 450);
-      const batch = writeBatch(db);
-      for (const id of chunk) {
-        batch.delete(doc(db, 'orders', id));
-      }
-      await batch.commit();
-      deleted += chunk.length;
-    }
-    return deleted;
+  async deleteArchivedOrders(_orderIds: string[], currentUser: StaffUser | null): Promise<number> {
+    assertAuthorizedStaff(currentUser);
+    throw new Error('Order deletion is disabled until backup safeguards are enforced.');
   }
 }
 

@@ -3,27 +3,18 @@ import type { CakeOrder, StaffUser } from '../types/order';
 import { formatUgx } from '../utils/currency';
 import { downloadOrdersCsv } from '../utils/csvExport';
 import { formatDateDisplay, getKampalaToday, isOlderThanMonths } from '../utils/dateKampala';
-import { ConfirmModal } from './ConfirmModal';
 
 interface ArchivePageProps {
   orders: CakeOrder[];
   user: StaffUser;
-  onDeleteArchivedOrders: (orderIds: string[]) => Promise<number>;
+  onDeleteArchivedOrders?: (orderIds: string[]) => Promise<number>;
 }
 
-export const ArchivePage: React.FC<ArchivePageProps> = ({
-  orders,
-  user,
-  onDeleteArchivedOrders,
-}) => {
+export const ArchivePage: React.FC<ArchivePageProps> = ({ orders }) => {
   const todayKampala = getKampalaToday();
   const [showAllOrders, setShowAllOrders] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [exportedIds, setExportedIds] = useState<Set<string>>(new Set());
-  const [backupVerified, setBackupVerified] = useState(false);
-  const [confirmPhrase, setConfirmPhrase] = useState('');
-  const [showDeleteModal, setShowDeleteModal] = useState(false);
-  const [deleting, setDeleting] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -37,16 +28,6 @@ export const ArchivePage: React.FC<ArchivePageProps> = ({
     () => visibleOrders.filter((o) => selectedIds.has(o.orderId)),
     [visibleOrders, selectedIds]
   );
-
-  const isOwner = user.role === 'owner';
-  const allSelectedExported =
-    selectedOrders.length > 0 && selectedOrders.every((o) => exportedIds.has(o.orderId));
-  const canRequestDelete =
-    isOwner &&
-    selectedOrders.length > 0 &&
-    allSelectedExported &&
-    backupVerified &&
-    confirmPhrase.trim() === 'DELETE ARCHIVED';
 
   const toggleSelect = (orderId: string) => {
     setSelectedIds((prev) => {
@@ -85,28 +66,8 @@ export const ArchivePage: React.FC<ArchivePageProps> = ({
       return next;
     });
     setStatusMessage(
-      `Exported ${selectedOrders.length} order(s) to ${filename}. Verify the file opens cleanly in Excel before considering any deletion.`
+      `Exported ${selectedOrders.length} order(s) to ${filename}. Verify the file opens cleanly in Excel.`
     );
-  };
-
-  const handleConfirmDelete = async () => {
-    setDeleting(true);
-    setErrorMessage(null);
-    setStatusMessage(null);
-    try {
-      const ids = selectedOrders.map((o) => o.orderId);
-      const count = await onDeleteArchivedOrders(ids);
-      setSelectedIds(new Set());
-      setBackupVerified(false);
-      setConfirmPhrase('');
-      setShowDeleteModal(false);
-      setStatusMessage(`Deleted ${count} archived order(s) from the active database.`);
-    } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : 'Failed to delete archived orders.');
-      setShowDeleteModal(false);
-    } finally {
-      setDeleting(false);
-    }
   };
 
   return (
@@ -119,7 +80,7 @@ export const ArchivePage: React.FC<ArchivePageProps> = ({
           Active database retention guideline: keep approximately the latest{' '}
           <strong>12 months</strong> of orders in Firestore. Orders older than 12 months are{' '}
           <strong>never</strong> deleted automatically. Export a verified CSV backup outside
-          Firebase first.
+          Firebase.
         </p>
 
         <div className="archive-controls">
@@ -211,57 +172,14 @@ export const ArchivePage: React.FC<ArchivePageProps> = ({
       </div>
 
       <div className="card danger-zone">
-        <h3 className="section-title">Owner-Only: Delete Archived Records</h3>
-        {!isOwner ? (
-          <div className="notice notice-warning" role="status">
-            <strong>Restricted to Shop Owner:</strong> You are signed in as <code>{user.role}</code>.
-            Staff members can export CSV backups, but only the shop owner can delete archived
-            orders (enforced in both the UI and <code>firestore.rules</code>).
-          </div>
-        ) : (
-          <div className="stack-md">
-            <p className="muted-text">
-              Deletion is permanent. To protect customer records, you must first export the selected
-              orders to CSV, verify the backup file outside Firebase, and confirm below.
-            </p>
-
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={backupVerified}
-                onChange={(e) => setBackupVerified(e.target.checked)}
-                disabled={!allSelectedExported}
-              />
-              <span>
-                I have opened and verified that a complete CSV backup of the selected{' '}
-                {selectedOrders.length} order(s) is safely stored outside Firebase.
-              </span>
-            </label>
-
-            <div className="field">
-              <label htmlFor="delete-confirm-phrase">
-                Type <code>DELETE ARCHIVED</code> to enable deletion
-              </label>
-              <input
-                id="delete-confirm-phrase"
-                type="text"
-                value={confirmPhrase}
-                onChange={(e) => setConfirmPhrase(e.target.value)}
-                placeholder="DELETE ARCHIVED"
-                disabled={!allSelectedExported || !backupVerified}
-              />
-            </div>
-
-            <button
-              type="button"
-              className="btn btn-danger"
-              disabled={!canRequestDelete}
-              onClick={() => setShowDeleteModal(true)}
-            >
-              Permanently Delete Selected Archived Orders ({selectedOrders.length})
-            </button>
-          </div>
-        )}
+        <h3 className="section-title">Deletion Disabled Pending Backup Safeguards</h3>
+        <div className="notice notice-warning" role="status">
+          <strong>Order and payment deletion is disabled:</strong> To protect customer and financial
+          records, deleting orders or payment transactions is blocked in both the app and{' '}
+          <code>firestore.rules</code> (<code>allow delete: if false</code>) until verified external
+          backup safeguards are enforced. Use <strong>Export Selected to CSV</strong> above to save
+          offline backups.
+        </div>
 
         <details className="setup-details">
           <summary>Notes on Firebase limits, automation &amp; costs</summary>
@@ -269,7 +187,7 @@ export const ArchivePage: React.FC<ArchivePageProps> = ({
             <li>
               <strong>Spark (Free) vs Blaze Plan:</strong> Scheduled Cloud Functions for automatic
               archiving require the Firebase <strong>Blaze (pay-as-you-go)</strong> plan. Manual
-              CSV export + owner deletion works on the free Spark plan.
+              CSV export works on the free Spark plan.
             </li>
             <li>
               <strong>Firestore Billing:</strong> Firestore charges per document read, write, and
@@ -284,17 +202,6 @@ export const ArchivePage: React.FC<ArchivePageProps> = ({
           </ul>
         </details>
       </div>
-
-      <ConfirmModal
-        open={showDeleteModal}
-        title="Permanently Delete Archived Orders?"
-        message={`You are about to permanently delete ${selectedOrders.length} order(s) from the active database. This cannot be undone. Proceed only if your external CSV backup is verified.`}
-        confirmLabel="Delete Permanently"
-        danger
-        busy={deleting}
-        onConfirm={handleConfirmDelete}
-        onCancel={() => setShowDeleteModal(false)}
-      />
     </section>
   );
 };

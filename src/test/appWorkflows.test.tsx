@@ -149,10 +149,16 @@ class TestMemoryOrderRepository implements OrderRepository {
     if (!user) throw new Error('Access denied');
     const idx = this.orders.findIndex((o) => o.orderId === orderId);
     if (idx === -1) throw new Error('Not found');
+    const existing = this.orders[idx];
+    const paid = existing.amountPaidUgx;
+    if (input.totalPriceUgx < paid) {
+      throw new Error('Total price cannot be less than the amount already paid.');
+    }
     const updated: CakeOrder = {
-      ...this.orders[idx],
+      ...existing,
       ...input,
-      balanceUgx: calculateBalanceUgx(input.totalPriceUgx, input.amountPaidUgx),
+      amountPaidUgx: paid,
+      balanceUgx: calculateBalanceUgx(input.totalPriceUgx, paid),
       updatedAt: new Date().toISOString(),
       updatedByUid: user.uid,
       updatedByEmail: user.email,
@@ -190,12 +196,16 @@ class TestMemoryOrderRepository implements OrderRepository {
     const cleanAmount = Math.round(amountUgx);
     if (cleanAmount <= 0) throw new Error('Payment amount must be positive.');
     const paymentId = idempotencyPaymentId || generatePaymentId(getKampalaToday());
-    if (this.payments.some((p) => p.paymentId === paymentId)) {
-      throw new Error('Duplicate payment prevented.');
-    }
     const idx = this.orders.findIndex((o) => o.orderId === orderId);
     if (idx === -1) throw new Error('Not found');
     const existing = this.orders[idx];
+    const existingPayment = this.payments.find((p) => p.paymentId === paymentId);
+    if (existingPayment) {
+      if (existingPayment.orderId === orderId && existingPayment.amountUgx === cleanAmount) {
+        return { order: existing, payment: existingPayment };
+      }
+      throw new Error('Duplicate payment prevented.');
+    }
     const nextPaid = existing.amountPaidUgx + cleanAmount;
     if (nextPaid > existing.totalPriceUgx) {
       throw new Error('Exceeds remaining balance.');
@@ -259,14 +269,9 @@ class TestMemoryOrderRepository implements OrderRepository {
     return sale;
   }
 
-  async deleteArchivedOrders(orderIds: string[], user: StaffUser | null): Promise<number> {
-    if (!user || user.role !== 'owner') {
-      throw new Error('Access denied: Only the shop owner can delete archived orders.');
-    }
-    const idSet = new Set(orderIds);
-    const before = this.orders.length;
-    this.orders = this.orders.filter((o) => !idSet.has(o.orderId));
-    return before - this.orders.length;
+  async deleteArchivedOrders(_orderIds: string[], user: StaffUser | null): Promise<number> {
+    if (!user) throw new Error('Access denied');
+    throw new Error('Order deletion is disabled until backup safeguards are enforced.');
   }
 }
 
@@ -567,20 +572,28 @@ describe('Cake Order Tracker workflows & access control', () => {
     expect(screen.getByText(/Historical Order Amounts Needing Review/i)).toBeInTheDocument();
   });
 
-  it('keeps Archive & CSV separate for the owner and enforces backup confirmation before delete', async () => {
+  it('keeps Archive & CSV separate for the owner and disables deletion pending backup safeguards', async () => {
     const user = userEvent.setup();
     const repo = new TestMemoryOrderRepository(makeTestOrders());
     render(<App repository={repo} />);
 
+    const ownerUser: StaffUser = {
+      uid: 'owner-1',
+      email: 'owner@shop.example',
+      displayName: 'Owner',
+      role: 'owner',
+      active: true,
+    };
+
     await expect(
-      repo.deleteArchivedOrders(['ORD-TEST-OLD'], {
-        uid: 'staff-1',
-        email: 'staff@shop.example',
-        displayName: 'Staff',
-        role: 'staff',
-        active: true,
-      })
-    ).rejects.toThrow(/Only the shop owner/i);
+      repo.deleteArchivedOrders(['ORD-TEST-OLD'], ownerUser)
+    ).rejects.toThrow(/deletion is disabled until backup safeguards are enforced/i);
+
+    // Retry with same paymentId is idempotent and does not double-count
+    const firstPay = await repo.recordOrderPayment('ORD-TEST-001', 25000, ownerUser, 'PAY-RETRY-1');
+    const retryPay = await repo.recordOrderPayment('ORD-TEST-001', 25000, ownerUser, 'PAY-RETRY-1');
+    expect(firstPay.order.amountPaidUgx).toBe(125000);
+    expect(retryPay.order.amountPaidUgx).toBe(125000);
 
     await signInAs(user, 'owner@shop.example');
     await user.click(await screen.findByRole('button', { name: /Archive & CSV/i }));
@@ -594,15 +607,9 @@ describe('Cake Order Tracker workflows & access control', () => {
     await user.click(screen.getByRole('button', { name: /Export Selected to CSV/i }));
     expect(createObjUrl).toHaveBeenCalledTimes(1);
 
-    await user.click(screen.getByLabelText(/I have opened and verified/i));
-    await user.type(screen.getByLabelText(/Type DELETE ARCHIVED/i), 'DELETE ARCHIVED');
-    await user.click(
-      screen.getByRole('button', { name: /Permanently Delete Selected Archived Orders/i })
-    );
-
-    const dialog = screen.getByRole('dialog');
-    await user.click(within(dialog).getByRole('button', { name: /Delete Permanently/i }));
-
-    expect(await screen.findByText(/Deleted 1 archived order/i)).toBeInTheDocument();
+    expect(screen.getByText(/Deletion Disabled Pending Backup Safeguards/i)).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: /Permanently Delete Selected Archived Orders/i })
+    ).not.toBeInTheDocument();
   });
 });

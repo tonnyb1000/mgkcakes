@@ -62,6 +62,7 @@ export interface CakeOrder {
   totalPriceUgx: number;
   amountPaidUgx: number;
   balanceUgx: number;
+  lastPaymentId?: string;
   pickupStatus: PickupStatus;
   createdAt: string; // ISO 8601 timestamp
   updatedAt: string; // ISO 8601 timestamp

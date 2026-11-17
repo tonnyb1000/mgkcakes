@@ -103,6 +103,31 @@ service cloud.firestore {
         && isNonEmptyString(data.receivedAt);
     }
 
+    function hasMatchingDepositAfter(orderDocId, orderData) {
+      return ('lastPaymentId' in orderData)
+        && isNonEmptyString(orderData.lastPaymentId)
+        && existsAfter(/databases/$(database)/documents/payments/$(orderData.lastPaymentId))
+        && getAfter(/databases/$(database)/documents/payments/$(orderData.lastPaymentId)).data.kind == 'order_deposit'
+        && getAfter(/databases/$(database)/documents/payments/$(orderData.lastPaymentId)).data.orderId == orderDocId
+        && getAfter(/databases/$(database)/documents/payments/$(orderData.lastPaymentId)).data.amountUgx == orderData.amountPaidUgx;
+    }
+
+    function hasMatchingBalancePaymentAfter(orderDocId, oldData, newData) {
+      return newData.amountPaidUgx > oldData.amountPaidUgx
+        && ('lastPaymentId' in newData)
+        && isNonEmptyString(newData.lastPaymentId)
+        && newData.lastPaymentId != oldData.get('lastPaymentId', '')
+        && existsAfter(/databases/$(database)/documents/payments/$(newData.lastPaymentId))
+        && getAfter(/databases/$(database)/documents/payments/$(newData.lastPaymentId)).data.kind == 'order_balance'
+        && getAfter(/databases/$(database)/documents/payments/$(newData.lastPaymentId)).data.orderId == orderDocId
+        && getAfter(/databases/$(database)/documents/payments/$(newData.lastPaymentId)).data.amountUgx == (newData.amountPaidUgx - oldData.amountPaidUgx);
+    }
+
+    function hasMatchingOrderAfter(paymentId, payData) {
+      return existsAfter(/databases/$(database)/documents/orders/$(payData.orderId))
+        && getAfter(/databases/$(database)/documents/orders/$(payData.orderId)).data.get('lastPaymentId', '') == paymentId;
+    }
+
     // Staff allowlist collection: managed by the shop owner.
     match /staffUsers/{uid} {
       allow read: if isSignedIn() && (request.auth.uid == uid || isOwner());
@@ -117,17 +142,28 @@ service cloud.firestore {
         && isValidOrderData(request.resource.data)
         && request.resource.data.orderId == orderDocId
         && request.resource.data.createdByUid == request.auth.uid
-        && request.resource.data.updatedByUid == request.auth.uid;
+        && request.resource.data.updatedByUid == request.auth.uid
+        && (
+          request.resource.data.amountPaidUgx == 0
+          || hasMatchingDepositAfter(orderDocId, request.resource.data)
+        );
 
       allow update: if isAuthorizedStaff()
         && isValidOrderData(request.resource.data)
         && request.resource.data.orderId == resource.data.orderId
         && request.resource.data.createdByUid == resource.data.createdByUid
         && request.resource.data.createdAt == resource.data.createdAt
-        && request.resource.data.updatedByUid == request.auth.uid;
+        && request.resource.data.updatedByUid == request.auth.uid
+        && (
+          (
+            request.resource.data.amountPaidUgx == resource.data.amountPaidUgx
+            && request.resource.data.get('lastPaymentId', '') == resource.data.get('lastPaymentId', '')
+          )
+          || hasMatchingBalancePaymentAfter(orderDocId, resource.data, request.resource.data)
+        );
 
-      // Deleting archived orders is strictly restricted to the owner.
-      allow delete: if isOwner();
+      // Order deletion is disabled until automated/verified backup safeguards are enforced.
+      allow delete: if false;
     }
 
     // Individual payment transactions (order deposits, later balance payments, walk-in sales).
@@ -137,10 +173,16 @@ service cloud.firestore {
       allow create: if isAuthorizedStaff()
         && isValidPaymentData(request.resource.data)
         && request.resource.data.paymentId == paymentId
-        && request.resource.data.recordedByUid == request.auth.uid;
+        && request.resource.data.recordedByUid == request.auth.uid
+        && (
+          request.resource.data.kind == 'walk_in'
+          || hasMatchingOrderAfter(paymentId, request.resource.data)
+        );
 
       allow update: if false;
-      allow delete: if isOwner();
+
+      // Payment deletion is disabled until automated/verified backup safeguards are enforced.
+      allow delete: if false;
     }
 
     // Deny everything else by default.

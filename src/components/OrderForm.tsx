@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import type {
   CakeOrder,
   CakeOrderInput,
@@ -115,6 +115,7 @@ export const OrderForm: React.FC<OrderFormProps> = ({
   const [paymentMessage, setPaymentMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [recordingPayment, setRecordingPayment] = useState(false);
+  const pendingPaymentIdRef = useRef<string | null>(null);
 
   const tierList = form.tierDetails ?? [];
   const calculatedTotal = useMemo(() => calculateTiersTotalUgx(tierList), [tierList]);
@@ -190,8 +191,11 @@ export const OrderForm: React.FC<OrderFormProps> = ({
 
     setRecordingPayment(true);
     try {
-      const paymentId = generatePaymentId(getKampalaToday());
-      await onRecordPayment(existingOrder.orderId, cleanExtra, paymentId);
+      if (!pendingPaymentIdRef.current) {
+        pendingPaymentIdRef.current = generatePaymentId(getKampalaToday());
+      }
+      await onRecordPayment(existingOrder.orderId, cleanExtra, pendingPaymentIdRef.current);
+      pendingPaymentIdRef.current = null;
       setForm((prev) => ({
         ...prev,
         amountPaidUgx: existingOrder.amountPaidUgx + cleanExtra,
@@ -528,7 +532,10 @@ export const OrderForm: React.FC<OrderFormProps> = ({
                     min={1}
                     step={500}
                     value={additionalPaymentInput}
-                    onChange={(e) => setAdditionalPaymentInput(e.target.value)}
+                    onChange={(e) => {
+                      setAdditionalPaymentInput(e.target.value);
+                      pendingPaymentIdRef.current = null;
+                    }}
                     placeholder="e.g. 50000"
                     disabled={recordingPayment || liveBalance === 0}
                   />

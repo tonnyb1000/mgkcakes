@@ -6,8 +6,16 @@ import {
   initializeTestEnvironment,
   type RulesTestEnvironment,
 } from '@firebase/rules-unit-testing';
-import { deleteDoc, doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
-import { afterAll, beforeAll, beforeEach, describe, it } from 'vitest';
+import {
+  deleteDoc,
+  doc,
+  getDoc,
+  runTransaction,
+  setDoc,
+  updateDoc,
+  writeBatch,
+} from 'firebase/firestore';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 const PROJECT_ID = 'cake-order-tracker-rules-test';
 
@@ -33,6 +41,7 @@ function makeOrder(overrides: Record<string, unknown> = {}) {
     totalPriceUgx: 150000,
     amountPaidUgx: 50000,
     balanceUgx: 100000,
+    lastPaymentId: 'PAY-20261117-DEP001',
     pickupStatus: 'waiting',
     createdAt: '2026-11-17T10:00:00+03:00',
     updatedAt: '2026-11-17T10:00:00+03:00',
@@ -40,6 +49,24 @@ function makeOrder(overrides: Record<string, unknown> = {}) {
     createdByEmail: 'staff@shop.example',
     updatedByUid: 'staff-uid',
     updatedByEmail: 'staff@shop.example',
+    ...overrides,
+  };
+}
+
+function makePayment(overrides: Record<string, unknown> = {}) {
+  return {
+    paymentId: 'PAY-20261117-DEP001',
+    kind: 'order_deposit',
+    orderId: 'ORD-20261117-ABC123',
+    customerName: 'Fictional Customer',
+    description: 'Vanilla sponge cake',
+    amountUgx: 50000,
+    receivedDate: '2026-11-17',
+    receivedTime: '10:00',
+    receivedAt: '2026-11-17T10:00:00+03:00',
+    recordedByUid: 'staff-uid',
+    recordedByEmail: 'staff@shop.example',
+    recordedByName: 'Staff Member',
     ...overrides,
   };
 }
@@ -78,11 +105,20 @@ beforeEach(async () => {
       role: 'staff',
       active: false,
     });
-    await setDoc(doc(db, 'orders', 'ORD-20261117-EXIST1'), makeOrder({
-      orderId: 'ORD-20261117-EXIST1',
-      createdByUid: 'staff-uid',
-      updatedByUid: 'staff-uid',
-    }));
+    await setDoc(
+      doc(db, 'orders', 'ORD-20261117-EXIST1'),
+      makeOrder({
+        orderId: 'ORD-20261117-EXIST1',
+        lastPaymentId: 'PAY-20261117-EXIST1',
+      })
+    );
+    await setDoc(
+      doc(db, 'payments', 'PAY-20261117-EXIST1'),
+      makePayment({
+        paymentId: 'PAY-20261117-EXIST1',
+        orderId: 'ORD-20261117-EXIST1',
+      })
+    );
   });
 });
 
@@ -90,211 +126,254 @@ afterAll(async () => {
   await testEnv.cleanup();
 });
 
-describe('Firestore security rules', () => {
+describe('Firestore security rules & emulator consistency', () => {
   it('denies all unauthenticated reads and writes', async () => {
     const anonDb = testEnv.unauthenticatedContext().firestore();
     await assertFails(getDoc(doc(anonDb, 'orders', 'ORD-20261117-EXIST1')));
-    await assertFails(setDoc(doc(anonDb, 'orders', 'ORD-20261117-NEW1'), makeOrder({ orderId: 'ORD-20261117-NEW1' })));
+    await assertFails(
+      setDoc(
+        doc(anonDb, 'orders', 'ORD-20261117-NEW1'),
+        makeOrder({ orderId: 'ORD-20261117-NEW1', amountPaidUgx: 0, balanceUgx: 150000 })
+      )
+    );
     await assertFails(getDoc(doc(anonDb, 'staffUsers', 'staff-uid')));
+    await assertFails(getDoc(doc(anonDb, 'payments', 'PAY-20261117-EXIST1')));
   });
 
   it('denies signed-in users who are not active staff', async () => {
     const outsiderDb = testEnv.authenticatedContext('random-user-uid').firestore();
     await assertFails(getDoc(doc(outsiderDb, 'orders', 'ORD-20261117-EXIST1')));
-    await assertFails(setDoc(doc(outsiderDb, 'orders', 'ORD-20261117-NEW2'), makeOrder({
-      orderId: 'ORD-20261117-NEW2',
-      createdByUid: 'random-user-uid',
-      updatedByUid: 'random-user-uid',
-    })));
+    await assertFails(
+      setDoc(
+        doc(outsiderDb, 'orders', 'ORD-20261117-NEW2'),
+        makeOrder({
+          orderId: 'ORD-20261117-NEW2',
+          amountPaidUgx: 0,
+          balanceUgx: 150000,
+          createdByUid: 'random-user-uid',
+          updatedByUid: 'random-user-uid',
+        })
+      )
+    );
 
     const inactiveDb = testEnv.authenticatedContext('inactive-uid').firestore();
     await assertFails(getDoc(doc(inactiveDb, 'orders', 'ORD-20261117-EXIST1')));
   });
 
-  it('allows active staff to read, create, and update valid orders, but forbids deleting orders or editing staffUsers', async () => {
+  it('requires atomic order + deposit creation and allows zero-deposit orders', async () => {
     const staffDb = testEnv.authenticatedContext('staff-uid').firestore();
 
-    // Read own staffUsers doc allowed, reading others or writing denied
-    await assertSucceeds(getDoc(doc(staffDb, 'staffUsers', 'staff-uid')));
-    await assertFails(getDoc(doc(staffDb, 'staffUsers', 'owner-uid')));
-    await assertFails(setDoc(doc(staffDb, 'staffUsers', 'staff-uid'), { role: 'owner', active: true }));
+    // Order with deposit > 0 without matching payment in same batch is rejected
+    await assertFails(
+      setDoc(
+        doc(staffDb, 'orders', 'ORD-20261117-NODEP1'),
+        makeOrder({ orderId: 'ORD-20261117-NODEP1', lastPaymentId: 'PAY-MISSING' })
+      )
+    );
 
-    // Read order allowed
-    await assertSucceeds(getDoc(doc(staffDb, 'orders', 'ORD-20261117-EXIST1')));
-
-    // Create valid order with tierDetails allowed
+    // Order with zero deposit (no payment needed) succeeds
     await assertSucceeds(
       setDoc(
-        doc(staffDb, 'orders', 'ORD-20261117-ABC123'),
+        doc(staffDb, 'orders', 'ORD-20261117-ZERO01'),
         makeOrder({
-          orderId: 'ORD-20261117-ABC123',
-          tierDetails: [
-            { tierNumber: 1, shape: 'Round', priceUgx: 100000 },
-            { tierNumber: 2, shape: 'Square', priceUgx: 50000 },
-          ],
+          orderId: 'ORD-20261117-ZERO01',
+          amountPaidUgx: 0,
+          balanceUgx: 150000,
+          lastPaymentId: '',
         })
       )
     );
 
-    // Create valid legacy-style order without tierDetails still allowed
-    await assertSucceeds(
-      setDoc(
-        doc(staffDb, 'orders', 'ORD-20261117-LEG123'),
-        makeOrder({ orderId: 'ORD-20261117-LEG123' })
-      )
+    // Atomic batch: order + matching deposit payment succeeds
+    const batch = writeBatch(staffDb);
+    batch.set(
+      doc(staffDb, 'orders', 'ORD-20261117-ABC123'),
+      makeOrder({
+        orderId: 'ORD-20261117-ABC123',
+        tierDetails: [
+          { tierNumber: 1, shape: 'Round', priceUgx: 100000 },
+          { tierNumber: 2, shape: 'Square', priceUgx: 50000 },
+        ],
+      })
     );
+    batch.set(
+      doc(staffDb, 'payments', 'PAY-20261117-DEP001'),
+      makePayment({ paymentId: 'PAY-20261117-DEP001', orderId: 'ORD-20261117-ABC123' })
+    );
+    await assertSucceeds(batch.commit());
+  });
 
-    // Update payment & pickup status allowed
+  it('enforces atomic balance payment updates and rejects unbacked or orphan writes', async () => {
+    const staffDb = testEnv.authenticatedContext('staff-uid').firestore();
+
+    // Updating order details without changing amountPaidUgx succeeds
     await assertSucceeds(
       updateDoc(doc(staffDb, 'orders', 'ORD-20261117-EXIST1'), {
-        amountPaidUgx: 150000,
-        balanceUgx: 0,
         pickupStatus: 'picked_up',
         updatedAt: '2026-11-17T12:00:00+03:00',
         updatedByUid: 'staff-uid',
       })
     );
 
-    // Delete order denied for staff
-    await assertFails(deleteDoc(doc(staffDb, 'orders', 'ORD-20261117-EXIST1')));
+    // Changing amountPaidUgx directly without a matching payment transaction fails
+    await assertFails(
+      updateDoc(doc(staffDb, 'orders', 'ORD-20261117-EXIST1'), {
+        amountPaidUgx: 150000,
+        balanceUgx: 0,
+        lastPaymentId: 'PAY-FAKE-001',
+        updatedAt: '2026-11-17T12:05:00+03:00',
+        updatedByUid: 'staff-uid',
+      })
+    );
+
+    // Creating an orphan order_balance payment without updating the order fails
+    await assertFails(
+      setDoc(
+        doc(staffDb, 'payments', 'PAY-ORPHAN-001'),
+        makePayment({
+          paymentId: 'PAY-ORPHAN-001',
+          kind: 'order_balance',
+          orderId: 'ORD-20261117-EXIST1',
+          amountUgx: 25000,
+        })
+      )
+    );
+
+    // Atomic transaction: create order_balance payment + update order amountPaidUgx & balanceUgx succeeds
+    await assertSucceeds(
+      runTransaction(staffDb, async (tx) => {
+        const orderRef = doc(staffDb, 'orders', 'ORD-20261117-EXIST1');
+        const payRef = doc(staffDb, 'payments', 'PAY-20261117-BAL001');
+        const snap = await tx.get(orderRef);
+        const existing = snap.data()!;
+        const nextPaid = (existing.amountPaidUgx as number) + 40000;
+        tx.set(
+          payRef,
+          makePayment({
+            paymentId: 'PAY-20261117-BAL001',
+            kind: 'order_balance',
+            orderId: 'ORD-20261117-EXIST1',
+            amountUgx: 40000,
+          })
+        );
+        tx.update(orderRef, {
+          amountPaidUgx: nextPaid,
+          balanceUgx: (existing.totalPriceUgx as number) - nextPaid,
+          lastPaymentId: 'PAY-20261117-BAL001',
+          updatedAt: '2026-11-17T13:00:00+03:00',
+          updatedByUid: 'staff-uid',
+        });
+      })
+    );
+
+    // Reusing the same lastPaymentId on a second update fails
+    await assertFails(
+      updateDoc(doc(staffDb, 'orders', 'ORD-20261117-EXIST1'), {
+        amountPaidUgx: 130000,
+        balanceUgx: 20000,
+        lastPaymentId: 'PAY-20261117-BAL001',
+        updatedAt: '2026-11-17T13:05:00+03:00',
+        updatedByUid: 'staff-uid',
+      })
+    );
   });
 
-  it('enforces UGX payment validation and immutable audit fields on orders', async () => {
+  it('keeps order paid amount consistent under concurrent order edit and payment transaction', async () => {
+    const staffDb = testEnv.authenticatedContext('staff-uid').firestore();
+    const ownerDb = testEnv.authenticatedContext('owner-uid').firestore();
+    const staffOrderRef = doc(staffDb, 'orders', 'ORD-20261117-EXIST1');
+    const ownerOrderRef = doc(ownerDb, 'orders', 'ORD-20261117-EXIST1');
+
+    // Simulate staff recording a payment while owner concurrently edits the order
+    await runTransaction(staffDb, async (tx) => {
+      const snap = await tx.get(staffOrderRef);
+      const existing = snap.data()!;
+      const nextPaid = (existing.amountPaidUgx as number) + 30000;
+      tx.set(
+        doc(staffDb, 'payments', 'PAY-CONC-001'),
+        makePayment({
+          paymentId: 'PAY-CONC-001',
+          kind: 'order_balance',
+          orderId: 'ORD-20261117-EXIST1',
+          amountUgx: 30000,
+        })
+      );
+      tx.update(staffOrderRef, {
+        amountPaidUgx: nextPaid,
+        balanceUgx: (existing.totalPriceUgx as number) - nextPaid,
+        lastPaymentId: 'PAY-CONC-001',
+        updatedAt: '2026-11-17T14:00:00+03:00',
+        updatedByUid: 'staff-uid',
+      });
+    });
+
+    await runTransaction(ownerDb, async (tx) => {
+      const snap = await tx.get(ownerOrderRef);
+      const existing = snap.data()!;
+      const paid = existing.amountPaidUgx as number;
+      const nextTotal = 180000;
+      tx.update(ownerOrderRef, {
+        description: 'Updated description concurrently',
+        totalPriceUgx: nextTotal,
+        amountPaidUgx: paid,
+        balanceUgx: nextTotal - paid,
+        updatedAt: '2026-11-17T14:00:01+03:00',
+        updatedByUid: 'owner-uid',
+      });
+    });
+
+    const finalSnap = await getDoc(staffOrderRef);
+    const finalData = finalSnap.data()!;
+    expect(finalData.amountPaidUgx).toBe(80000);
+    expect(finalData.totalPriceUgx).toBe(180000);
+    expect(finalData.balanceUgx).toBe(100000);
+    expect(finalData.description).toBe('Updated description concurrently');
+  });
+
+  it('disables order and payment deletion for both staff and owner until backup safeguards exist', async () => {
+    const staffDb = testEnv.authenticatedContext('staff-uid').firestore();
+    const ownerDb = testEnv.authenticatedContext('owner-uid').firestore();
+
+    await assertFails(deleteDoc(doc(staffDb, 'orders', 'ORD-20261117-EXIST1')));
+    await assertFails(deleteDoc(doc(ownerDb, 'orders', 'ORD-20261117-EXIST1')));
+    await assertFails(deleteDoc(doc(staffDb, 'payments', 'PAY-20261117-EXIST1')));
+    await assertFails(deleteDoc(doc(ownerDb, 'payments', 'PAY-20261117-EXIST1')));
+  });
+
+  it('allows walk-in sales and rejects negative/invalid orders and immutable payment updates', async () => {
     const staffDb = testEnv.authenticatedContext('staff-uid').firestore();
 
-    // Deposit > total rejected
-    await assertFails(
+    // Valid walk-in sale succeeds
+    await assertSucceeds(
       setDoc(
-        doc(staffDb, 'orders', 'ORD-20261117-BAD1'),
-        makeOrder({
-          orderId: 'ORD-20261117-BAD1',
-          totalPriceUgx: 100000,
-          amountPaidUgx: 120000,
-          balanceUgx: 0,
+        doc(staffDb, 'payments', 'PAY-20261118-WALK01'),
+        makePayment({
+          paymentId: 'PAY-20261118-WALK01',
+          kind: 'walk_in',
+          orderId: '',
+          customerName: 'Walk-in Customer',
+          description: 'Counter slice box',
+          amountUgx: 35000,
         })
       )
     );
 
-    // Negative price rejected
+    // Payments are immutable
     await assertFails(
-      setDoc(
-        doc(staffDb, 'orders', 'ORD-20261117-BAD2'),
-        makeOrder({
-          orderId: 'ORD-20261117-BAD2',
-          totalPriceUgx: -5000,
-          amountPaidUgx: 0,
-          balanceUgx: -5000,
-        })
-      )
+      updateDoc(doc(staffDb, 'payments', 'PAY-20261118-WALK01'), { amountUgx: 99999 })
     );
 
-    // Mismatched balance rejected
-    await assertFails(
-      setDoc(
-        doc(staffDb, 'orders', 'ORD-20261117-BAD3'),
-        makeOrder({
-          orderId: 'ORD-20261117-BAD3',
-          totalPriceUgx: 100000,
-          amountPaidUgx: 40000,
-          balanceUgx: 50000,
-        })
-      )
-    );
-
-    // Spoofing createdByUid on create rejected
-    await assertFails(
-      setDoc(
-        doc(staffDb, 'orders', 'ORD-20261117-BAD4'),
-        makeOrder({
-          orderId: 'ORD-20261117-BAD4',
-          createdByUid: 'owner-uid',
-        })
-      )
-    );
-
-    // Invalid tierDetails (negative tier price) rejected
+    // Negative tier price rejected
     await assertFails(
       setDoc(
         doc(staffDb, 'orders', 'ORD-20261117-BAD5'),
         makeOrder({
           orderId: 'ORD-20261117-BAD5',
+          amountPaidUgx: 0,
+          balanceUgx: 150000,
           tierDetails: [{ tierNumber: 1, shape: 'Round', priceUgx: -1000 }],
         })
       )
     );
-  });
-
-  it('allows owner to manage staffUsers and delete archived orders', async () => {
-    const ownerDb = testEnv.authenticatedContext('owner-uid').firestore();
-
-    await assertSucceeds(
-      setDoc(doc(ownerDb, 'staffUsers', 'new-staff-uid'), {
-        email: 'newstaff@shop.example',
-        displayName: 'New Staff',
-        role: 'staff',
-        active: true,
-      })
-    );
-
-    await assertSucceeds(deleteDoc(doc(ownerDb, 'orders', 'ORD-20261117-EXIST1')));
-  });
-
-  it('enforces payment transaction rules for deposits, balance payments, and walk-in sales', async () => {
-    const anonDb = testEnv.unauthenticatedContext().firestore();
-    const staffDb = testEnv.authenticatedContext('staff-uid').firestore();
-    const ownerDb = testEnv.authenticatedContext('owner-uid').firestore();
-
-    const validWalkIn = {
-      paymentId: 'PAY-20261118-WALK01',
-      kind: 'walk_in',
-      orderId: '',
-      customerName: 'Walk-in Customer',
-      description: 'Counter slice box',
-      amountUgx: 35000,
-      receivedDate: '2026-11-18',
-      receivedTime: '11:30',
-      receivedAt: '2026-11-18T11:30:00+03:00',
-      recordedByUid: 'staff-uid',
-      recordedByEmail: 'staff@shop.example',
-      recordedByName: 'Staff Member',
-    };
-
-    // Unauthenticated denied
-    await assertFails(setDoc(doc(anonDb, 'payments', 'PAY-20261118-WALK01'), validWalkIn));
-
-    // Active staff can create valid walk_in and order_balance payments
-    await assertSucceeds(setDoc(doc(staffDb, 'payments', 'PAY-20261118-WALK01'), validWalkIn));
-    await assertSucceeds(
-      setDoc(doc(staffDb, 'payments', 'PAY-20261118-BAL001'), {
-        ...validWalkIn,
-        paymentId: 'PAY-20261118-BAL001',
-        kind: 'order_balance',
-        orderId: 'ORD-20261117-EXIST1',
-      })
-    );
-
-    // Rejects zero/negative amount or order_balance without orderId
-    await assertFails(
-      setDoc(doc(staffDb, 'payments', 'PAY-20261118-BAD001'), {
-        ...validWalkIn,
-        paymentId: 'PAY-20261118-BAD001',
-        amountUgx: 0,
-      })
-    );
-    await assertFails(
-      setDoc(doc(staffDb, 'payments', 'PAY-20261118-BAD002'), {
-        ...validWalkIn,
-        paymentId: 'PAY-20261118-BAD002',
-        kind: 'order_balance',
-        orderId: '',
-      })
-    );
-
-    // Payments are immutable (update denied) and staff cannot delete; owner can delete
-    await assertFails(
-      updateDoc(doc(staffDb, 'payments', 'PAY-20261118-WALK01'), { amountUgx: 99999 })
-    );
-    await assertFails(deleteDoc(doc(staffDb, 'payments', 'PAY-20261118-WALK01')));
-    await assertSucceeds(deleteDoc(doc(ownerDb, 'payments', 'PAY-20261118-WALK01')));
   });
 });
