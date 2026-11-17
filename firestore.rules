@@ -1,0 +1,151 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function staffDocPath() {
+      return /databases/$(database)/documents/staffUsers/$(request.auth.uid);
+    }
+
+    function hasStaffDoc() {
+      return isSignedIn() && exists(staffDocPath());
+    }
+
+    function staffData() {
+      return get(staffDocPath()).data;
+    }
+
+    function isAuthorizedStaff() {
+      return hasStaffDoc()
+        && staffData().active == true
+        && staffData().role in ['staff', 'owner'];
+    }
+
+    function isOwner() {
+      return hasStaffDoc()
+        && staffData().active == true
+        && staffData().role == 'owner';
+    }
+
+    function isNonEmptyString(val) {
+      return val is string && val.size() > 0;
+    }
+
+    function isValidDateString(val) {
+      return val is string && val.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function isValidTierEntry(tier) {
+      return tier is map
+        && tier.tierNumber is int
+        && tier.tierNumber >= 1
+        && isNonEmptyString(tier.shape)
+        && (tier.priceUgx is int || tier.priceUgx is float)
+        && tier.priceUgx >= 0;
+    }
+
+    function hasValidOptionalTiers(data) {
+      return !('tierDetails' in data)
+        || (
+          data.tierDetails is list
+          && data.tierDetails.size() >= 1
+          && data.tierDetails.size() <= 10
+          && isValidTierEntry(data.tierDetails[0])
+          && (data.tierDetails.size() < 2 || isValidTierEntry(data.tierDetails[1]))
+          && (data.tierDetails.size() < 3 || isValidTierEntry(data.tierDetails[2]))
+          && (data.tierDetails.size() < 4 || isValidTierEntry(data.tierDetails[3]))
+          && (data.tierDetails.size() < 5 || isValidTierEntry(data.tierDetails[4]))
+        );
+    }
+
+    function isValidOrderData(data) {
+      return isNonEmptyString(data.orderId)
+        && isNonEmptyString(data.customerName)
+        && isNonEmptyString(data.customerPhone)
+        && isValidDateString(data.orderDate)
+        && isValidDateString(data.pickupDate)
+        && (data.pickupTime is string)
+        && isNonEmptyString(data.description)
+        && (data.design is string)
+        && (data.colour is string)
+        && data.icingType in ['buttercream', 'fondant', 'other']
+        && (data.inscriptionOrDecoration is string)
+        && (data.size is string)
+        && (data.shape is string)
+        && (data.tiers is string)
+        && (data.totalPriceUgx is int || data.totalPriceUgx is float)
+        && (data.amountPaidUgx is int || data.amountPaidUgx is float)
+        && (data.balanceUgx is int || data.balanceUgx is float)
+        && data.totalPriceUgx >= 0
+        && data.amountPaidUgx >= 0
+        && data.amountPaidUgx <= data.totalPriceUgx
+        && data.balanceUgx == (data.totalPriceUgx - data.amountPaidUgx)
+        && data.pickupStatus in ['waiting', 'picked_up']
+        && hasValidOptionalTiers(data);
+    }
+
+    function isValidPaymentData(data) {
+      return isNonEmptyString(data.paymentId)
+        && data.kind in ['order_deposit', 'order_balance', 'walk_in']
+        && (
+          (data.kind == 'walk_in' && data.orderId == '')
+          || (data.kind in ['order_deposit', 'order_balance'] && isNonEmptyString(data.orderId))
+        )
+        && isNonEmptyString(data.description)
+        && (data.amountUgx is int || data.amountUgx is float)
+        && data.amountUgx > 0
+        && isValidDateString(data.receivedDate)
+        && data.receivedTime is string
+        && data.receivedTime.matches('^[0-9]{2}:[0-9]{2}$')
+        && isNonEmptyString(data.receivedAt);
+    }
+
+    // Staff allowlist collection: managed by the shop owner.
+    match /staffUsers/{uid} {
+      allow read: if isSignedIn() && (request.auth.uid == uid || isOwner());
+      allow create, update, delete: if isOwner();
+    }
+
+    // Customer cake orders collection: accessible only to active authorised staff/owner.
+    match /orders/{orderDocId} {
+      allow read: if isAuthorizedStaff();
+
+      allow create: if isAuthorizedStaff()
+        && isValidOrderData(request.resource.data)
+        && request.resource.data.orderId == orderDocId
+        && request.resource.data.createdByUid == request.auth.uid
+        && request.resource.data.updatedByUid == request.auth.uid;
+
+      allow update: if isAuthorizedStaff()
+        && isValidOrderData(request.resource.data)
+        && request.resource.data.orderId == resource.data.orderId
+        && request.resource.data.createdByUid == resource.data.createdByUid
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.updatedByUid == request.auth.uid;
+
+      // Deleting archived orders is strictly restricted to the owner.
+      allow delete: if isOwner();
+    }
+
+    // Individual payment transactions (order deposits, later balance payments, walk-in sales).
+    match /payments/{paymentId} {
+      allow read: if isAuthorizedStaff();
+
+      allow create: if isAuthorizedStaff()
+        && isValidPaymentData(request.resource.data)
+        && request.resource.data.paymentId == paymentId
+        && request.resource.data.recordedByUid == request.auth.uid;
+
+      allow update: if false;
+      allow delete: if isOwner();
+    }
+
+    // Deny everything else by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
