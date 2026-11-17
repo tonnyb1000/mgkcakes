@@ -18,12 +18,58 @@ import {
   type OrderValidationErrors,
 } from '../utils/currency';
 import { formatDateDisplay, formatTimestampKampala, getKampalaToday } from '../utils/dateKampala';
+import { generateOrderId } from '../utils/orderId';
 import { CakeTierBuilder } from './CakeTierBuilder';
+
+export const PENDING_NEW_ORDER_STORAGE_KEY = 'cake_order_pending_new_order_v1';
+
+interface PendingNewOrderDraft {
+  orderId: string;
+  paymentId: string;
+  form: CakeOrderInput;
+}
+
+function loadPendingNewOrderDraft(): PendingNewOrderDraft | null {
+  if (typeof window === 'undefined' || !window.sessionStorage) return null;
+  try {
+    const raw = window.sessionStorage.getItem(PENDING_NEW_ORDER_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PendingNewOrderDraft;
+    if (parsed && parsed.orderId && parsed.paymentId && parsed.form) {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function savePendingNewOrderDraft(draft: PendingNewOrderDraft): void {
+  if (typeof window === 'undefined' || !window.sessionStorage) return;
+  try {
+    window.sessionStorage.setItem(PENDING_NEW_ORDER_STORAGE_KEY, JSON.stringify(draft));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+export function clearPendingNewOrderDraft(): void {
+  if (typeof window === 'undefined' || !window.sessionStorage) return;
+  try {
+    window.sessionStorage.removeItem(PENDING_NEW_ORDER_STORAGE_KEY);
+  } catch {
+    // Ignore storage errors
+  }
+}
 
 interface OrderFormProps {
   existingOrder?: CakeOrder | null;
   orderPayments?: PaymentTransaction[];
-  onSave: (input: CakeOrderInput, orderId?: string) => Promise<void>;
+  onSave: (
+    input: CakeOrderInput,
+    orderId?: string,
+    newOrderIdempotency?: { orderId: string; paymentId: string }
+  ) => Promise<void>;
   onRecordPayment?: (
     orderId: string,
     amountUgx: number,
@@ -108,7 +154,21 @@ export const OrderForm: React.FC<OrderFormProps> = ({
   onCancel,
 }) => {
   const isEditing = Boolean(existingOrder);
-  const [form, setForm] = useState<CakeOrderInput>(() => buildInitialState(existingOrder));
+  const initialDraft = useMemo(
+    () => (isEditing ? null : loadPendingNewOrderDraft()),
+    [isEditing]
+  );
+  const [form, setForm] = useState<CakeOrderInput>(() =>
+    initialDraft ? initialDraft.form : buildInitialState(existingOrder)
+  );
+  const pendingNewOrderIdsRef = useRef<{ orderId: string; paymentId: string }>(
+    initialDraft
+      ? { orderId: initialDraft.orderId, paymentId: initialDraft.paymentId }
+      : {
+          orderId: generateOrderId(getKampalaToday()),
+          paymentId: generatePaymentId(getKampalaToday()),
+        }
+  );
   const [additionalPaymentInput, setAdditionalPaymentInput] = useState('');
   const [errors, setErrors] = useState<OrderValidationErrors>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -131,7 +191,17 @@ export const OrderForm: React.FC<OrderFormProps> = ({
   );
 
   const updateField = <K extends keyof CakeOrderInput>(key: K, value: CakeOrderInput[K]) => {
-    setForm((prev) => ({ ...prev, [key]: value }));
+    setForm((prev) => {
+      const next = { ...prev, [key]: value };
+      if (!isEditing) {
+        savePendingNewOrderDraft({
+          orderId: pendingNewOrderIdsRef.current.orderId,
+          paymentId: pendingNewOrderIdsRef.current.paymentId,
+          form: next,
+        });
+      }
+      return next;
+    });
     setErrors((prev) => {
       if (!prev[key]) return prev;
       const next = { ...prev };
@@ -145,13 +215,23 @@ export const OrderForm: React.FC<OrderFormProps> = ({
     const uniqueShapes = Array.from(
       new Set(nextTiers.map((t) => t.shape.trim()).filter(Boolean))
     );
-    setForm((prev) => ({
-      ...prev,
-      tierDetails: nextTiers,
-      tiers: String(nextTiers.length),
-      shape: uniqueShapes.join(', '),
-      totalPriceUgx: nextTotal,
-    }));
+    setForm((prev) => {
+      const next = {
+        ...prev,
+        tierDetails: nextTiers,
+        tiers: String(nextTiers.length),
+        shape: uniqueShapes.join(', '),
+        totalPriceUgx: nextTotal,
+      };
+      if (!isEditing) {
+        savePendingNewOrderDraft({
+          orderId: pendingNewOrderIdsRef.current.orderId,
+          paymentId: pendingNewOrderIdsRef.current.paymentId,
+          form: next,
+        });
+      }
+      return next;
+    });
     setErrors((prev) => {
       const next = { ...prev };
       delete next.tierDetails;
@@ -227,9 +307,24 @@ export const OrderForm: React.FC<OrderFormProps> = ({
       return;
     }
 
+    if (!isEditing) {
+      savePendingNewOrderDraft({
+        orderId: pendingNewOrderIdsRef.current.orderId,
+        paymentId: pendingNewOrderIdsRef.current.paymentId,
+        form: payload,
+      });
+    }
+
     setSaving(true);
     try {
-      await onSave(payload, existingOrder?.orderId);
+      await onSave(
+        payload,
+        existingOrder?.orderId,
+        isEditing ? undefined : pendingNewOrderIdsRef.current
+      );
+      if (!isEditing) {
+        clearPendingNewOrderDraft();
+      }
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : 'Failed to save order.');
     } finally {
@@ -255,7 +350,14 @@ export const OrderForm: React.FC<OrderFormProps> = ({
           )}
         </div>
         {onCancel && (
-          <button type="button" className="btn btn-secondary btn-sm" onClick={onCancel}>
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm"
+            onClick={() => {
+              if (!isEditing) clearPendingNewOrderDraft();
+              onCancel();
+            }}
+          >
             Back
           </button>
         )}
@@ -573,7 +675,14 @@ export const OrderForm: React.FC<OrderFormProps> = ({
 
         <div className="form-actions">
           {onCancel && (
-            <button type="button" className="btn btn-secondary" onClick={onCancel}>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => {
+                if (!isEditing) clearPendingNewOrderDraft();
+                onCancel();
+              }}
+            >
               Cancel
             </button>
           )}

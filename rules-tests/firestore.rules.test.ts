@@ -171,7 +171,20 @@ describe('Firestore security rules & emulator consistency', () => {
       )
     );
 
-    // Order with zero deposit (no payment needed) succeeds
+    // Zero-deposit order cannot pre-reference a future payment ID
+    await assertFails(
+      setDoc(
+        doc(staffDb, 'orders', 'ORD-20261117-ZERO-BAD'),
+        makeOrder({
+          orderId: 'ORD-20261117-ZERO-BAD',
+          amountPaidUgx: 0,
+          balanceUgx: 150000,
+          lastPaymentId: 'PAY-FUTURE-001',
+        })
+      )
+    );
+
+    // Order with zero deposit (no payment needed) succeeds when lastPaymentId is empty
     await assertSucceeds(
       setDoc(
         doc(staffDb, 'orders', 'ORD-20261117-ZERO01'),
@@ -180,6 +193,19 @@ describe('Firestore security rules & emulator consistency', () => {
           amountPaidUgx: 0,
           balanceUgx: 150000,
           lastPaymentId: '',
+        })
+      )
+    );
+
+    // Creating a payment later for that zero-deposit order without updating its balance is rejected
+    await assertFails(
+      setDoc(
+        doc(staffDb, 'payments', 'PAY-FUTURE-001'),
+        makePayment({
+          paymentId: 'PAY-FUTURE-001',
+          kind: 'order_balance',
+          orderId: 'ORD-20261117-ZERO01',
+          amountUgx: 50000,
         })
       )
     );
@@ -273,6 +299,17 @@ describe('Firestore security rules & emulator consistency', () => {
         balanceUgx: 20000,
         lastPaymentId: 'PAY-20261117-BAL001',
         updatedAt: '2026-11-17T13:05:00+03:00',
+        updatedByUid: 'staff-uid',
+      })
+    );
+
+    // Reusing an OLDER payment ID (PAY-20261117-EXIST1) to inflate amountPaidUgx fails
+    await assertFails(
+      updateDoc(doc(staffDb, 'orders', 'ORD-20261117-EXIST1'), {
+        amountPaidUgx: 140000,
+        balanceUgx: 10000,
+        lastPaymentId: 'PAY-20261117-EXIST1',
+        updatedAt: '2026-11-17T13:10:00+03:00',
         updatedByUid: 'staff-uid',
       })
     );

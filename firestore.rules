@@ -106,6 +106,7 @@ service cloud.firestore {
     function hasMatchingDepositAfter(orderDocId, orderData) {
       return ('lastPaymentId' in orderData)
         && isNonEmptyString(orderData.lastPaymentId)
+        && !exists(/databases/$(database)/documents/payments/$(orderData.lastPaymentId))
         && existsAfter(/databases/$(database)/documents/payments/$(orderData.lastPaymentId))
         && getAfter(/databases/$(database)/documents/payments/$(orderData.lastPaymentId)).data.kind == 'order_deposit'
         && getAfter(/databases/$(database)/documents/payments/$(orderData.lastPaymentId)).data.orderId == orderDocId
@@ -117,6 +118,7 @@ service cloud.firestore {
         && ('lastPaymentId' in newData)
         && isNonEmptyString(newData.lastPaymentId)
         && newData.lastPaymentId != oldData.get('lastPaymentId', '')
+        && !exists(/databases/$(database)/documents/payments/$(newData.lastPaymentId))
         && existsAfter(/databases/$(database)/documents/payments/$(newData.lastPaymentId))
         && getAfter(/databases/$(database)/documents/payments/$(newData.lastPaymentId)).data.kind == 'order_balance'
         && getAfter(/databases/$(database)/documents/payments/$(newData.lastPaymentId)).data.orderId == orderDocId
@@ -125,7 +127,21 @@ service cloud.firestore {
 
     function hasMatchingOrderAfter(paymentId, payData) {
       return existsAfter(/databases/$(database)/documents/orders/$(payData.orderId))
-        && getAfter(/databases/$(database)/documents/orders/$(payData.orderId)).data.get('lastPaymentId', '') == paymentId;
+        && getAfter(/databases/$(database)/documents/orders/$(payData.orderId)).data.get('lastPaymentId', '') == paymentId
+        && (
+          (
+            payData.kind == 'order_deposit'
+            && !exists(/databases/$(database)/documents/orders/$(payData.orderId))
+            && getAfter(/databases/$(database)/documents/orders/$(payData.orderId)).data.amountPaidUgx == payData.amountUgx
+          )
+          || (
+            payData.kind == 'order_balance'
+            && exists(/databases/$(database)/documents/orders/$(payData.orderId))
+            && getAfter(/databases/$(database)/documents/orders/$(payData.orderId)).data.amountPaidUgx == (
+              get(/databases/$(database)/documents/orders/$(payData.orderId)).data.amountPaidUgx + payData.amountUgx
+            )
+          )
+        );
     }
 
     // Staff allowlist collection: managed by the shop owner.
@@ -144,8 +160,14 @@ service cloud.firestore {
         && request.resource.data.createdByUid == request.auth.uid
         && request.resource.data.updatedByUid == request.auth.uid
         && (
-          request.resource.data.amountPaidUgx == 0
-          || hasMatchingDepositAfter(orderDocId, request.resource.data)
+          (
+            request.resource.data.amountPaidUgx == 0
+            && request.resource.data.get('lastPaymentId', '') == ''
+          )
+          || (
+            request.resource.data.amountPaidUgx > 0
+            && hasMatchingDepositAfter(orderDocId, request.resource.data)
+          )
         );
 
       allow update: if isAuthorizedStaff()

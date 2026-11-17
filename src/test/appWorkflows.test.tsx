@@ -49,7 +49,7 @@ class TestMemoryOrderRepository implements OrderRepository {
     };
   }
 
-  async signIn(email: string): Promise<StaffUser> {
+  async signIn(email: string, _password?: string): Promise<StaffUser> {
     const isOwner = email.toLowerCase().includes('owner');
     const user: StaffUser = {
       uid: isOwner ? 'owner-1' : 'staff-1',
@@ -78,17 +78,29 @@ class TestMemoryOrderRepository implements OrderRepository {
     return [...this.payments];
   }
 
-  async createOrder(input: CakeOrderInput, user: StaffUser | null): Promise<CakeOrder> {
+  async createOrder(
+    input: CakeOrderInput,
+    user: StaffUser | null,
+    idempotency?: { orderId?: string; paymentId?: string }
+  ): Promise<CakeOrder> {
     if (!user) throw new Error('Access denied');
     const errors = validateOrderInput(input);
     const first = Object.values(errors)[0];
     if (first) throw new Error(first);
 
+    const orderId = idempotency?.orderId || generateOrderId(input.orderDate);
+    const existing = this.orders.find((o) => o.orderId === orderId);
+    if (existing) {
+      return existing;
+    }
+
     const now = new Date();
     const nowIso = now.toISOString();
     const paid = Math.round(input.amountPaidUgx);
+    const receivedDate = getKampalaToday(now);
+    const paymentId = paid > 0 ? idempotency?.paymentId || generatePaymentId(receivedDate) : '';
     const order: CakeOrder = {
-      orderId: generateOrderId(input.orderDate),
+      orderId,
       customerName: input.customerName.trim(),
       customerPhone: input.customerPhone.trim(),
       orderDate: input.orderDate,
@@ -109,6 +121,7 @@ class TestMemoryOrderRepository implements OrderRepository {
       totalPriceUgx: Math.round(input.totalPriceUgx),
       amountPaidUgx: paid,
       balanceUgx: calculateBalanceUgx(input.totalPriceUgx, paid),
+      ...(paymentId ? { lastPaymentId: paymentId } : {}),
       pickupStatus: input.pickupStatus ?? 'waiting',
       createdAt: nowIso,
       updatedAt: nowIso,
@@ -118,11 +131,10 @@ class TestMemoryOrderRepository implements OrderRepository {
       updatedByEmail: user.email,
     };
     this.orders = [order, ...this.orders];
-    if (paid > 0) {
-      const receivedDate = getKampalaToday(now);
+    if (paid > 0 && paymentId) {
       this.payments = [
         {
-          paymentId: generatePaymentId(receivedDate),
+          paymentId,
           kind: 'order_deposit',
           orderId: order.orderId,
           customerName: order.customerName,
@@ -611,5 +623,79 @@ describe('Cake Order Tracker workflows & access control', () => {
     expect(
       screen.queryByRole('button', { name: /Permanently Delete Selected Archived Orders/i })
     ).not.toBeInTheDocument();
+  });
+
+  it('makes new-order retries safe after an uncertain save failure or page refresh', async () => {
+    const user = userEvent.setup();
+    const baseRepo = new TestMemoryOrderRepository(makeTestOrders());
+
+    // Simulate a save that commits on server but throws an uncertain network error to the client
+    let failOnce = true;
+    const flakyRepo: OrderRepository = {
+      configured: true,
+      subscribeAuth: (cb) => baseRepo.subscribeAuth(cb),
+      signIn: (e, p) => baseRepo.signIn(e, p),
+      signOut: () => baseRepo.signOut(),
+      listOrders: (u) => baseRepo.listOrders(u),
+      listPayments: (u) => baseRepo.listPayments(u),
+      updateOrder: (id, inp, u) => baseRepo.updateOrder(id, inp, u),
+      updatePickupStatus: (id, st, u) => baseRepo.updatePickupStatus(id, st, u),
+      recordOrderPayment: (id, amt, u, pid) => baseRepo.recordOrderPayment(id, amt, u, pid),
+      recordWalkInSale: (inp, u, pid) => baseRepo.recordWalkInSale(inp, u, pid),
+      deleteArchivedOrders: (ids, u) => baseRepo.deleteArchivedOrders(ids, u),
+      async createOrder(input, staffUser, idempotency) {
+        const created = await baseRepo.createOrder(input, staffUser, idempotency);
+        if (failOnce) {
+          failOnce = false;
+          throw new Error('Network connection lost after submit');
+        }
+        return created;
+      },
+    };
+
+    const { unmount } = render(<App repository={flakyRepo} />);
+    await signInAs(user, 'staff@shop.example');
+    await user.click(await screen.findByRole('button', { name: /New Order/i }));
+
+    await user.type(screen.getByLabelText(/Customer Name/i), 'Retry Safe Customer');
+    await user.type(screen.getByLabelText(/Phone Number/i), '0772111999');
+    await user.type(screen.getByLabelText(/Cake Description/i), 'Chocolate sponge');
+    const tier1Quick = screen.getByRole('group', { name: /Quick prices for Tier 1/i });
+    await user.click(within(tier1Quick).getByRole('button', { name: '80,000' }));
+    const paidInput = screen.getByLabelText(/Deposit Paid \(UGX\)/i);
+    await user.clear(paidInput);
+    await user.type(paidInput, '30000');
+
+    await user.click(screen.getByRole('button', { name: /Save Order/i }));
+    expect(await screen.findByText(/Network connection lost after submit/i)).toBeInTheDocument();
+
+    // Simulate a page refresh: unmount and remount App with the same sessionStorage draft
+    unmount();
+    render(<App repository={flakyRepo} />);
+    await user.click(await screen.findByRole('button', { name: /New Order/i }));
+
+    // Draft is restored; retry Save Order
+    expect(screen.getByLabelText(/Customer Name/i)).toHaveValue('Retry Safe Customer');
+    await user.click(screen.getByRole('button', { name: /Save Order/i }));
+    await screen.findByText('Retry Safe Customer');
+
+    // Verify no duplicate order or duplicate deposit payment was created
+    const staffUser: StaffUser = {
+      uid: 'staff-1',
+      email: 'staff@shop.example',
+      displayName: 'Staff User',
+      role: 'staff',
+      active: true,
+    };
+    const allOrders = await baseRepo.listOrders(staffUser);
+    const matchingOrders = allOrders.filter((o) => o.customerName === 'Retry Safe Customer');
+    expect(matchingOrders).toHaveLength(1);
+
+    const allPayments = await baseRepo.listPayments(staffUser);
+    const matchingPayments = allPayments.filter(
+      (p) => p.orderId === matchingOrders[0].orderId
+    );
+    expect(matchingPayments).toHaveLength(1);
+    expect(matchingPayments[0].amountUgx).toBe(30000);
   });
 });

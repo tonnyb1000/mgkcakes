@@ -37,7 +37,11 @@ export interface OrderRepository {
   signOut(): Promise<void>;
   listOrders(currentUser: StaffUser | null): Promise<CakeOrder[]>;
   listPayments(currentUser: StaffUser | null): Promise<PaymentTransaction[]>;
-  createOrder(input: CakeOrderInput, currentUser: StaffUser | null): Promise<CakeOrder>;
+  createOrder(
+    input: CakeOrderInput,
+    currentUser: StaffUser | null,
+    idempotency?: { orderId?: string; paymentId?: string }
+  ): Promise<CakeOrder>;
   updateOrder(
     orderId: string,
     input: CakeOrderInput,

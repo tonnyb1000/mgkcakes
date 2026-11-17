@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { AuthScreen } from './components/AuthScreen';
 import { ArchivePage } from './components/ArchivePage';
 import { HeaderBar, type ActiveTab } from './components/HeaderBar';
+import { clearPendingNewOrderDraft } from './components/OrderForm';
 import { OrderForm } from './components/OrderForm';
 import { OrdersPage } from './components/OrdersPage';
 import { SalesCollectionsPage } from './components/SalesCollectionsPage';
@@ -76,13 +77,18 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
   };
 
   const handleSignOut = async () => {
+    clearPendingNewOrderDraft();
     await repo.signOut();
     setEditingOrder(null);
     setActiveTab('home');
     setBannerMessage(null);
   };
 
-  const handleSaveOrder = async (input: CakeOrderInput, orderId?: string) => {
+  const handleSaveOrder = async (
+    input: CakeOrderInput,
+    orderId?: string,
+    newOrderIdempotency?: { orderId: string; paymentId: string }
+  ) => {
     if (orderId) {
       const updated = await repo.updateOrder(orderId, input, user);
       setOrders((prev) => prev.map((o) => (o.orderId === orderId ? updated : o)));
@@ -90,8 +96,12 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
       setActiveTab('orders');
       setBannerMessage(`Order ${updated.orderId} updated.`);
     } else {
-      const created = await repo.createOrder(input, user);
-      setOrders((prev) => [created, ...prev]);
+      const created = await repo.createOrder(input, user, newOrderIdempotency);
+      setOrders((prev) =>
+        prev.some((o) => o.orderId === created.orderId)
+          ? prev.map((o) => (o.orderId === created.orderId ? created : o))
+          : [created, ...prev]
+      );
       if (created.amountPaidUgx > 0) {
         const latestPayments = await repo.listPayments(user);
         setPayments(latestPayments);
