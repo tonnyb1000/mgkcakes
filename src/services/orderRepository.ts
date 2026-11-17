@@ -64,7 +64,8 @@ export interface OrderRepository {
   updateOrder(
     orderId: string,
     input: CakeOrderInput,
-    currentUser: StaffUser | null
+    currentUser: StaffUser | null,
+    expectedUpdatedAt?: string
   ): Promise<CakeOrder>;
   updatePickupStatus(
     orderId: string,
@@ -347,7 +348,8 @@ export class FirestoreOrderRepository implements OrderRepository {
   async updateOrder(
     orderId: string,
     input: CakeOrderInput,
-    currentUser: StaffUser | null
+    currentUser: StaffUser | null,
+    expectedUpdatedAt?: string
   ): Promise<CakeOrder> {
     assertAuthorizedStaff(currentUser);
     assertValidOrder(input);
@@ -362,6 +364,15 @@ export class FirestoreOrderRepository implements OrderRepository {
         throw new Error(`Order ${orderId} was not found.`);
       }
       const existing = existingSnap.data() as CakeOrder;
+
+      if (expectedUpdatedAt && existing.updatedAt !== expectedUpdatedAt) {
+        const differences = diffOrderInputAgainstSaved(existing, {
+          ...input,
+          amountPaidUgx: existing.amountPaidUgx,
+        });
+        throw new OrderReconcileConflictError(existing, differences);
+      }
+
       // Preserve latest server amountPaidUgx & lastPaymentId under concurrent edits.
       const paid = existing.amountPaidUgx;
       if (total < paid) {

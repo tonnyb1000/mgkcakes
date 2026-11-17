@@ -167,12 +167,20 @@ class TestMemoryOrderRepository implements OrderRepository {
   async updateOrder(
     orderId: string,
     input: CakeOrderInput,
-    user: StaffUser | null
+    user: StaffUser | null,
+    expectedUpdatedAt?: string
   ): Promise<CakeOrder> {
     if (!user) throw new Error('Access denied');
     const idx = this.orders.findIndex((o) => o.orderId === orderId);
     if (idx === -1) throw new Error('Not found');
     const existing = this.orders[idx];
+    if (expectedUpdatedAt && existing.updatedAt !== expectedUpdatedAt) {
+      const diffs = diffOrderInputAgainstSaved(existing, {
+        ...input,
+        amountPaidUgx: existing.amountPaidUgx,
+      });
+      throw new OrderReconcileConflictError(existing, diffs);
+    }
     const paid = existing.amountPaidUgx;
     if (input.totalPriceUgx < paid) {
       throw new Error('Total price cannot be less than the amount already paid.');
@@ -182,7 +190,7 @@ class TestMemoryOrderRepository implements OrderRepository {
       ...input,
       amountPaidUgx: paid,
       balanceUgx: calculateBalanceUgx(input.totalPriceUgx, paid),
-      updatedAt: new Date().toISOString(),
+      updatedAt: new Date(Date.now() + 1000).toISOString(),
       updatedByUid: user.uid,
       updatedByEmail: user.email,
     };
@@ -650,7 +658,7 @@ describe('Cake Order Tracker workflows & access control', () => {
       listOrders: (u) => baseRepo.listOrders(u),
       getOrderById: (id, u) => baseRepo.getOrderById(id, u),
       listPayments: (u) => baseRepo.listPayments(u),
-      updateOrder: (id, inp, u) => baseRepo.updateOrder(id, inp, u),
+      updateOrder: (id, inp, u, exp) => baseRepo.updateOrder(id, inp, u, exp),
       updatePickupStatus: (id, st, u) => baseRepo.updatePickupStatus(id, st, u),
       recordOrderPayment: (id, amt, u, pid) => baseRepo.recordOrderPayment(id, amt, u, pid),
       recordWalkInSale: (inp, u, pid) => baseRepo.recordWalkInSale(inp, u, pid),
@@ -724,7 +732,7 @@ describe('Cake Order Tracker workflows & access control', () => {
       listOrders: (u) => baseRepo.listOrders(u),
       getOrderById: (id, u) => baseRepo.getOrderById(id, u),
       listPayments: (u) => baseRepo.listPayments(u),
-      updateOrder: (id, inp, u) => baseRepo.updateOrder(id, inp, u),
+      updateOrder: (id, inp, u, exp) => baseRepo.updateOrder(id, inp, u, exp),
       updatePickupStatus: (id, st, u) => baseRepo.updatePickupStatus(id, st, u),
       recordOrderPayment: (id, amt, u, pid) => baseRepo.recordOrderPayment(id, amt, u, pid),
       recordWalkInSale: (inp, u, pid) => baseRepo.recordWalkInSale(inp, u, pid),
@@ -782,5 +790,128 @@ describe('Cake Order Tracker workflows & access control', () => {
     };
     const allOrders = await baseRepo.listOrders(staffUser);
     expect(allOrders.filter((o) => o.customerName === 'Reconcile Customer')).toHaveLength(1);
+  });
+
+  it('refreshes payments after reconciling an order with deposit so Daily Collections includes it', async () => {
+    const user = userEvent.setup();
+    const baseRepo = new TestMemoryOrderRepository(makeTestOrders());
+
+    let failOnce = true;
+    const flakyRepo: OrderRepository = {
+      configured: true,
+      subscribeAuth: (cb) => baseRepo.subscribeAuth(cb),
+      signIn: (e, p) => baseRepo.signIn(e, p),
+      signOut: () => baseRepo.signOut(),
+      listOrders: (u) => baseRepo.listOrders(u),
+      getOrderById: (id, u) => baseRepo.getOrderById(id, u),
+      listPayments: (u) => baseRepo.listPayments(u),
+      updateOrder: (id, inp, u, exp) => baseRepo.updateOrder(id, inp, u, exp),
+      updatePickupStatus: (id, st, u) => baseRepo.updatePickupStatus(id, st, u),
+      recordOrderPayment: (id, amt, u, pid) => baseRepo.recordOrderPayment(id, amt, u, pid),
+      recordWalkInSale: (inp, u, pid) => baseRepo.recordWalkInSale(inp, u, pid),
+      deleteArchivedOrders: (ids, u) => baseRepo.deleteArchivedOrders(ids, u),
+      async createOrder(input, staffUser, idempotency) {
+        const created = await baseRepo.createOrder(input, staffUser, idempotency);
+        if (failOnce) {
+          failOnce = false;
+          throw new Error('Uncertain network timeout');
+        }
+        return created;
+      },
+    };
+
+    render(<App repository={flakyRepo} />);
+    await signInAs(user, 'staff@shop.example');
+    await user.click(await screen.findByRole('button', { name: /New Order/i }));
+
+    await user.type(screen.getByLabelText(/Customer Name/i), 'Deposit Reconcile');
+    await user.type(screen.getByLabelText(/Phone Number/i), '0772333444');
+    await user.type(screen.getByLabelText(/Cake Description/i), 'Initial vanilla');
+    const tier1Quick = screen.getByRole('group', { name: /Quick prices for Tier 1/i });
+    await user.click(within(tier1Quick).getByRole('button', { name: '100,000' }));
+    const paidInput = screen.getByLabelText(/Deposit Paid \(UGX\)/i);
+    await user.clear(paidInput);
+    await user.type(paidInput, '40000');
+
+    await user.click(screen.getByRole('button', { name: /Save Order/i }));
+    expect(await screen.findByText(/Uncertain network timeout/i)).toBeInTheDocument();
+
+    const descInput = screen.getByLabelText(/Cake Description/i);
+    await user.clear(descInput);
+    await user.type(descInput, 'Reconciled vanilla');
+    await user.click(screen.getByRole('button', { name: /Save Order/i }));
+    await user.click(await screen.findByRole('button', { name: /Update Saved Order with My Edits/i }));
+    await screen.findByText('Reconciled vanilla');
+
+    // Daily Collections must include the UGX 40,000 deposit from the reconciled order
+    await user.click(screen.getByRole('button', { name: /Daily Collections/i }));
+    const summaryGrid = screen.getByLabelText(/Daily collections summary/i);
+    expect(within(summaryGrid).getAllByText('UGX 40,000').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('detects concurrent edits on existing orders and warns before leaving unsaved edits', async () => {
+    const user = userEvent.setup();
+    const repo = new TestMemoryOrderRepository(makeTestOrders());
+    render(<App repository={repo} />);
+
+    await signInAs(user, 'staff@shop.example');
+    await user.click(await screen.findByRole('button', { name: /View Orders/i }));
+
+    const aminaCard = (await screen.findByText('Amina Namukasa')).closest('article')!;
+    await user.click(within(aminaCard).getByRole('button', { name: /View or Edit Order/i }));
+
+    // Simulate another staff member updating ORD-TEST-001 on the server while this form is open
+    const otherStaff: StaffUser = {
+      uid: 'staff-2',
+      email: 'other@shop.example',
+      displayName: 'Other Staff',
+      role: 'staff',
+      active: true,
+    };
+    const currentOnServer = (await repo.getOrderById('ORD-TEST-001', otherStaff))!;
+    await repo.updateOrder(
+      'ORD-TEST-001',
+      {
+        customerName: currentOnServer.customerName,
+        customerPhone: currentOnServer.customerPhone,
+        orderDate: currentOnServer.orderDate,
+        pickupDate: currentOnServer.pickupDate,
+        pickupTime: currentOnServer.pickupTime,
+        description: 'Concurrent server description',
+        design: currentOnServer.design,
+        colour: currentOnServer.colour,
+        icingType: currentOnServer.icingType,
+        icingOtherNote: currentOnServer.icingOtherNote,
+        inscriptionOrDecoration: currentOnServer.inscriptionOrDecoration,
+        size: currentOnServer.size,
+        shape: currentOnServer.shape,
+        tiers: currentOnServer.tiers,
+        tierDetails: currentOnServer.tierDetails,
+        totalPriceUgx: currentOnServer.totalPriceUgx,
+        amountPaidUgx: currentOnServer.amountPaidUgx,
+      },
+      otherStaff
+    );
+
+    // Local user edits description -> unsaved edit warning on Back
+    const descInput = screen.getByLabelText(/Cake Description/i);
+    await user.clear(descInput);
+    await user.type(descInput, 'My local edit');
+
+    await user.click(screen.getByRole('button', { name: /^Back$/i }));
+    const leaveDialog = screen.getByRole('dialog');
+    expect(within(leaveDialog).getByText(/Discard Unsaved Edits\?/i)).toBeInTheDocument();
+    await user.click(within(leaveDialog).getByRole('button', { name: /Stay on Order/i }));
+    expect(screen.getByLabelText(/Cake Description/i)).toHaveValue('My local edit');
+
+    // Save Changes -> detects concurrent edit and asks how to resolve
+    await user.click(screen.getByRole('button', { name: /Save Changes/i }));
+    expect(await screen.findByText(/Concurrent edit detected on ORD-TEST-001/i)).toBeInTheDocument();
+    expect(screen.getByText('Concurrent server description', { selector: 'code' })).toBeInTheDocument();
+    expect(screen.getByText('My local edit', { selector: 'code' })).toBeInTheDocument();
+
+    // Choose Reload Latest Order -> loads server version without overwriting
+    await user.click(screen.getByRole('button', { name: /Reload Latest Order/i }));
+    expect(screen.getByLabelText(/Cake Description/i)).toHaveValue('Concurrent server description');
   });
 });

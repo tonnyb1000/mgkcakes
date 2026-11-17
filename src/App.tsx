@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { AuthScreen } from './components/AuthScreen';
 import { ArchivePage } from './components/ArchivePage';
+import { ConfirmModal } from './components/ConfirmModal';
 import { HeaderBar, type ActiveTab } from './components/HeaderBar';
 import { clearPendingNewOrderDraft } from './components/OrderForm';
 import { OrderForm } from './components/OrderForm';
@@ -29,6 +30,8 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
 
   const [activeTab, setActiveTab] = useState<ActiveTab>('home');
   const [editingOrder, setEditingOrder] = useState<CakeOrder | null>(null);
+  const [editingDirty, setEditingDirty] = useState(false);
+  const [pendingNavAction, setPendingNavAction] = useState<(() => void) | null>(null);
 
   const [orders, setOrders] = useState<CakeOrder[]>([]);
   const [payments, setPayments] = useState<PaymentTransaction[]>([]);
@@ -76,27 +79,44 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
     await repo.signIn(email, password);
   };
 
-  const handleSignOut = async () => {
+  const performSignOut = async () => {
     clearPendingNewOrderDraft();
     await repo.signOut();
     setEditingOrder(null);
+    setEditingDirty(false);
     setActiveTab('home');
     setBannerMessage(null);
+  };
+
+  const handleSignOut = async () => {
+    if (editingOrder && editingDirty) {
+      setPendingNavAction(() => () => {
+        void performSignOut();
+      });
+      return;
+    }
+    await performSignOut();
   };
 
   const handleSaveOrder = async (
     input: CakeOrderInput,
     orderId?: string,
-    newOrderIdempotency?: { orderId: string; paymentId: string }
+    newOrderIdempotency?: { orderId: string; paymentId: string },
+    expectedUpdatedAt?: string
   ) => {
     if (orderId) {
-      const updated = await repo.updateOrder(orderId, input, user);
+      const updated = await repo.updateOrder(orderId, input, user, expectedUpdatedAt);
       setOrders((prev) =>
         prev.some((o) => o.orderId === orderId)
           ? prev.map((o) => (o.orderId === orderId ? updated : o))
           : [updated, ...prev]
       );
+      if (updated.amountPaidUgx > 0) {
+        const latestPayments = await repo.listPayments(user);
+        setPayments(latestPayments);
+      }
       setEditingOrder(null);
+      setEditingDirty(false);
       setActiveTab('orders');
       setBannerMessage(`Order ${updated.orderId} updated.`);
     } else {
@@ -158,7 +178,17 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
   };
 
   const handleTabChange = (tab: ActiveTab) => {
+    if (editingOrder && editingDirty) {
+      setPendingNavAction(() => () => {
+        setEditingOrder(null);
+        setEditingDirty(false);
+        setBannerMessage(null);
+        setActiveTab(tab);
+      });
+      return;
+    }
     setEditingOrder(null);
+    setEditingDirty(false);
     setBannerMessage(null);
     setActiveTab(tab);
   };
@@ -213,8 +243,18 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
               existingOrder={editingOrder}
               orderPayments={editingOrderPayments}
               onSave={handleSaveOrder}
+              onReloadExistingOrder={(latest) => {
+                setOrders((prev) =>
+                  prev.map((o) => (o.orderId === latest.orderId ? latest : o))
+                );
+                setEditingOrder(latest);
+              }}
+              onDirtyChange={setEditingDirty}
               onRecordPayment={handleRecordOrderPayment}
-              onCancel={() => setEditingOrder(null)}
+              onCancel={() => {
+                setEditingOrder(null);
+                setEditingDirty(false);
+              }}
             />
           ) : activeTab === 'new' ? (
             <OrderForm
@@ -337,6 +377,21 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
               )}
             </section>
           )}
+
+          <ConfirmModal
+            open={Boolean(pendingNavAction)}
+            title="Discard Unsaved Edits?"
+            message={`You have unsaved changes to order ${editingOrder?.orderId ?? ''}. Leave without saving?`}
+            confirmLabel="Discard Changes"
+            cancelLabel="Stay on Order"
+            danger
+            onConfirm={() => {
+              const action = pendingNavAction;
+              setPendingNavAction(null);
+              action?.();
+            }}
+            onCancel={() => setPendingNavAction(null)}
+          />
         </main>
       )}
     </div>

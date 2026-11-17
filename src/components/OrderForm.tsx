@@ -25,6 +25,7 @@ import {
   type OrderFieldDiff,
 } from '../utils/reconcileOrder';
 import { CakeTierBuilder } from './CakeTierBuilder';
+import { ConfirmModal } from './ConfirmModal';
 
 export const PENDING_NEW_ORDER_STORAGE_KEY = 'cake_order_pending_new_order_v1';
 
@@ -74,10 +75,13 @@ interface OrderFormProps {
   onSave: (
     input: CakeOrderInput,
     orderId?: string,
-    newOrderIdempotency?: { orderId: string; paymentId: string }
+    newOrderIdempotency?: { orderId: string; paymentId: string },
+    expectedUpdatedAt?: string
   ) => Promise<void>;
   onCheckExistingOrder?: (orderId: string) => Promise<CakeOrder | null>;
   onResolveKeepSaved?: (existingOrder: CakeOrder) => void;
+  onReloadExistingOrder?: (latestOrder: CakeOrder) => void;
+  onDirtyChange?: (dirty: boolean) => void;
   onRecordPayment?: (
     orderId: string,
     amountUgx: number,
@@ -160,6 +164,8 @@ export const OrderForm: React.FC<OrderFormProps> = ({
   onSave,
   onCheckExistingOrder,
   onResolveKeepSaved,
+  onReloadExistingOrder,
+  onDirtyChange,
   onRecordPayment,
   onCancel,
 }) => {
@@ -180,6 +186,7 @@ export const OrderForm: React.FC<OrderFormProps> = ({
         }
   );
   const saveAttemptedRef = useRef<boolean>(Boolean(initialDraft?.saveAttempted));
+  const expectedUpdatedAtRef = useRef<string | undefined>(existingOrder?.updatedAt);
   const [additionalPaymentInput, setAdditionalPaymentInput] = useState('');
   const [errors, setErrors] = useState<OrderValidationErrors>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -187,10 +194,17 @@ export const OrderForm: React.FC<OrderFormProps> = ({
     existingOrder: CakeOrder;
     differences: OrderFieldDiff[];
   } | null>(null);
+  const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
   const [paymentMessage, setPaymentMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [recordingPayment, setRecordingPayment] = useState(false);
   const pendingPaymentIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (existingOrder?.updatedAt) {
+      expectedUpdatedAtRef.current = existingOrder.updatedAt;
+    }
+  }, [existingOrder?.updatedAt]);
 
   useEffect(() => {
     if (isEditing || !initialDraft?.saveAttempted || !onCheckExistingOrder) return;
@@ -221,6 +235,33 @@ export const OrderForm: React.FC<OrderFormProps> = ({
       existingOrder ? getUnrecordedHistoricalAmount(existingOrder, orderPayments) : 0,
     [existingOrder, orderPayments]
   );
+
+  const isEditingDirty = useMemo(() => {
+    if (!isEditing || !existingOrder) return false;
+    const diffs = diffOrderInputAgainstSaved(existingOrder, {
+      ...form,
+      totalPriceUgx: calculatedTotal,
+      amountPaidUgx: existingOrder.amountPaidUgx,
+    });
+    return diffs.length > 0;
+  }, [isEditing, existingOrder, form, calculatedTotal]);
+
+  useEffect(() => {
+    onDirtyChange?.(isEditingDirty);
+    return () => {
+      onDirtyChange?.(false);
+    };
+  }, [isEditingDirty, onDirtyChange]);
+
+  useEffect(() => {
+    if (!isEditingDirty) return;
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [isEditingDirty]);
 
   const updateField = <K extends keyof CakeOrderInput>(key: K, value: CakeOrderInput[K]) => {
     setForm((prev) => {
@@ -373,10 +414,13 @@ export const OrderForm: React.FC<OrderFormProps> = ({
       await onSave(
         payload,
         existingOrder?.orderId,
-        isEditing ? undefined : pendingNewOrderIdsRef.current
+        isEditing ? undefined : pendingNewOrderIdsRef.current,
+        isEditing ? expectedUpdatedAtRef.current : undefined
       );
       if (!isEditing) {
         clearPendingNewOrderDraft();
+      } else {
+        onDirtyChange?.(false);
       }
     } catch (err) {
       if (err instanceof OrderReconcileConflictError) {
@@ -394,6 +438,15 @@ export const OrderForm: React.FC<OrderFormProps> = ({
 
   const handleKeepSavedOrder = () => {
     if (!reconcileConflict) return;
+    if (isEditing) {
+      const latest = reconcileConflict.existingOrder;
+      setForm(buildInitialState(latest));
+      expectedUpdatedAtRef.current = latest.updatedAt;
+      setReconcileConflict(null);
+      setSubmitError(null);
+      onReloadExistingOrder?.(latest);
+      return;
+    }
     clearPendingNewOrderDraft();
     const saved = reconcileConflict.existingOrder;
     setReconcileConflict(null);
@@ -407,18 +460,41 @@ export const OrderForm: React.FC<OrderFormProps> = ({
     setSubmitError(null);
     const payload: CakeOrderInput = {
       ...form,
+      amountPaidUgx: reconcileConflict.existingOrder.amountPaidUgx,
       totalPriceUgx: calculatedTotal,
     };
     setSaving(true);
     try {
-      await onSave(payload, reconcileConflict.existingOrder.orderId);
+      await onSave(
+        payload,
+        reconcileConflict.existingOrder.orderId,
+        undefined,
+        reconcileConflict.existingOrder.updatedAt
+      );
       clearPendingNewOrderDraft();
       setReconcileConflict(null);
+      onDirtyChange?.(false);
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : 'Failed to update saved order.');
+      if (err instanceof OrderReconcileConflictError) {
+        setReconcileConflict({
+          existingOrder: err.existingOrder,
+          differences: err.differences,
+        });
+      } else {
+        setSubmitError(err instanceof Error ? err.message : 'Failed to update saved order.');
+      }
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleCancelClick = () => {
+    if (!onCancel) return;
+    if (isEditing && isEditingDirty) {
+      setShowLeaveConfirm(true);
+      return;
+    }
+    onCancel();
   };
 
   const handleDiscardNewDraft = () => {
@@ -455,7 +531,7 @@ export const OrderForm: React.FC<OrderFormProps> = ({
           <button
             type="button"
             className="btn btn-secondary btn-sm"
-            onClick={onCancel}
+            onClick={handleCancelClick}
           >
             Back
           </button>
@@ -482,16 +558,24 @@ export const OrderForm: React.FC<OrderFormProps> = ({
         <div className="notice notice-warning stack-md" role="alert">
           <div>
             <strong>
-              Order {reconcileConflict.existingOrder.orderId} was already saved on the server
+              {isEditing
+                ? `Concurrent edit detected on ${reconcileConflict.existingOrder.orderId}`
+                : `Order ${reconcileConflict.existingOrder.orderId} was already saved on the server`}
             </strong>
             {reconcileConflict.differences.length > 0 ? (
               <p>
-                Your local draft differs from the saved order. Choose whether to keep the saved
-                order or update it with your edits (the saved paid amount of{' '}
+                {isEditing
+                  ? 'Another staff member updated this order while you were editing it. Choose whether to reload their latest version or overwrite with your edits'
+                  : 'Your local draft differs from the saved order. Choose whether to keep the saved order or update it with your edits'}{' '}
+                (the saved paid amount of{' '}
                 {formatUgx(reconcileConflict.existingOrder.amountPaidUgx)} is preserved):
               </p>
             ) : (
-              <p>Your draft matches the saved order. No duplicate will be created.</p>
+              <p>
+                {isEditing
+                  ? 'Another staff member updated this order (for example, a payment or status change), and your edited fields match. Reload the latest version or save again.'
+                  : 'Your draft matches the saved order. No duplicate will be created.'}
+              </p>
             )}
           </div>
 
@@ -513,16 +597,20 @@ export const OrderForm: React.FC<OrderFormProps> = ({
               onClick={handleKeepSavedOrder}
               disabled={saving}
             >
-              Keep Saved Order
+              {isEditing ? 'Reload Latest Order' : 'Keep Saved Order'}
             </button>
-            {reconcileConflict.differences.length > 0 && (
+            {(reconcileConflict.differences.length > 0 || isEditing) && (
               <button
                 type="button"
                 className="btn btn-primary btn-sm"
                 onClick={handleApplyDraftOverSaved}
                 disabled={saving}
               >
-                {saving ? 'Updating…' : 'Update Saved Order with My Edits'}
+                {saving
+                  ? 'Updating…'
+                  : isEditing
+                  ? 'Overwrite with My Edits'
+                  : 'Update Saved Order with My Edits'}
               </button>
             )}
           </div>
@@ -844,7 +932,7 @@ export const OrderForm: React.FC<OrderFormProps> = ({
             <button
               type="button"
               className="btn btn-secondary"
-              onClick={onCancel}
+              onClick={handleCancelClick}
             >
               Cancel
             </button>
@@ -854,6 +942,21 @@ export const OrderForm: React.FC<OrderFormProps> = ({
           </button>
         </div>
       </form>
+
+      <ConfirmModal
+        open={showLeaveConfirm}
+        title="Discard Unsaved Edits?"
+        message={`You have unsaved changes to order ${existingOrder?.orderId ?? ''}. Leave without saving?`}
+        confirmLabel="Discard Changes"
+        cancelLabel="Stay on Order"
+        danger
+        onConfirm={() => {
+          setShowLeaveConfirm(false);
+          onDirtyChange?.(false);
+          onCancel?.();
+        }}
+        onCancel={() => setShowLeaveConfirm(false)}
+      />
     </section>
   );
 };
