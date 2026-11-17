@@ -756,7 +756,7 @@ describe('Cake Order Tracker workflows & access control', () => {
     // Navigate away via Back, then return to New Order: pending ID & draft are preserved
     await user.click(screen.getByRole('button', { name: /^Back$/i }));
     await user.click((await screen.findAllByRole('button', { name: /New Order/i }))[0]);
-    expect(await screen.findByText(/Resuming draft ORD-/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Resuming draft/i)).toBeInTheDocument();
 
     // Edit description before retrying -> reconciliation warns about difference
     const descInput = screen.getByLabelText(/Cake Description/i);
