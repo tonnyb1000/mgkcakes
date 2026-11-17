@@ -91,7 +91,11 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
   ) => {
     if (orderId) {
       const updated = await repo.updateOrder(orderId, input, user);
-      setOrders((prev) => prev.map((o) => (o.orderId === orderId ? updated : o)));
+      setOrders((prev) =>
+        prev.some((o) => o.orderId === orderId)
+          ? prev.map((o) => (o.orderId === orderId ? updated : o))
+          : [updated, ...prev]
+      );
       setEditingOrder(null);
       setActiveTab('orders');
       setBannerMessage(`Order ${updated.orderId} updated.`);
