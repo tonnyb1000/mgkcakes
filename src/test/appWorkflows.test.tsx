@@ -767,7 +767,7 @@ describe('Cake Order Tracker workflows & access control', () => {
     expect(await screen.findByText(/was already saved on the server/i)).toBeInTheDocument();
     expect(screen.getByText(/Cake Description:/i)).toBeInTheDocument();
     expect(screen.getByText(/Original vanilla cake/i)).toBeInTheDocument();
-    expect(screen.getByText(/Updated vanilla berry cake/i)).toBeInTheDocument();
+    expect(screen.getByText('Updated vanilla berry cake', { selector: 'code' })).toBeInTheDocument();
 
     // Apply edits to the saved order without creating a duplicate
     await user.click(screen.getByRole('button', { name: /Update Saved Order with My Edits/i }));
