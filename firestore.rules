@@ -21,13 +21,13 @@ service cloud.firestore {
     function isAuthorizedStaff() {
       return hasStaffDoc()
         && staffData().active == true
-        && staffData().role in ['staff', 'owner'];
+        && staffData().role in ['staff', 'owner', 'admin'];
     }
 
-    function isOwner() {
+    function isAdmin() {
       return hasStaffDoc()
         && staffData().active == true
-        && staffData().role == 'owner';
+        && staffData().role in ['owner', 'admin'];
     }
 
     function isNonEmptyString(val) {
@@ -90,6 +90,7 @@ service cloud.firestore {
     function isValidPaymentData(data) {
       return isNonEmptyString(data.paymentId)
         && data.kind in ['order_deposit', 'order_balance', 'walk_in']
+        && (!('paymentMethod' in data) || data.paymentMethod in ['cash', 'mobile_money'])
         && (
           (data.kind == 'walk_in' && data.orderId == '')
           || (data.kind in ['order_deposit', 'order_balance'] && isNonEmptyString(data.orderId))
@@ -101,6 +102,21 @@ service cloud.firestore {
         && data.receivedTime is string
         && data.receivedTime.matches('^[0-9]{2}:[0-9]{2}$')
         && isNonEmptyString(data.receivedAt);
+    }
+
+    function isValidCashFlowData(data) {
+      return isNonEmptyString(data.entryId)
+        && data.type in ['other_sale', 'expense']
+        && (!('paymentMethod' in data) || data.paymentMethod in ['cash', 'mobile_money'])
+        && isNonEmptyString(data.description)
+        && (data.amountUgx is int || data.amountUgx is float)
+        && data.amountUgx > 0
+        && isValidDateString(data.entryDate)
+        && data.entryTime is string
+        && data.entryTime.matches('^[0-9]{2}:[0-9]{2}$')
+        && isNonEmptyString(data.createdAt)
+        && isNonEmptyString(data.recordedByUid)
+        && isNonEmptyString(data.recordedByEmail);
     }
 
     function hasMatchingDepositAfter(orderDocId, orderData) {
@@ -137,6 +153,7 @@ service cloud.firestore {
           || (
             payData.kind == 'order_balance'
             && exists(/databases/$(database)/documents/orders/$(payData.orderId))
+            && !('deletedAt' in get(/databases/$(database)/documents/orders/$(payData.orderId)).data)
             && getAfter(/databases/$(database)/documents/orders/$(payData.orderId)).data.amountPaidUgx == (
               get(/databases/$(database)/documents/orders/$(payData.orderId)).data.amountPaidUgx + payData.amountUgx
             )
@@ -144,18 +161,19 @@ service cloud.firestore {
         );
     }
 
-    // Staff allowlist collection: managed by the shop owner.
+    // Staff allowlist collection: managed by admin/owner.
     match /staffUsers/{uid} {
-      allow read: if isSignedIn() && (request.auth.uid == uid || isOwner());
-      allow create, update, delete: if isOwner();
+      allow read: if isSignedIn() && (request.auth.uid == uid || isAdmin());
+      allow create, update, delete: if isAdmin();
     }
 
-    // Customer cake orders collection: accessible only to active authorised staff/owner.
+    // Customer cake orders collection: accessible only to active authorised staff/admin.
     match /orders/{orderDocId} {
       allow read: if isAuthorizedStaff();
 
       allow create: if isAuthorizedStaff()
         && isValidOrderData(request.resource.data)
+        && !('deletedAt' in request.resource.data)
         && request.resource.data.orderId == orderDocId
         && request.resource.data.createdByUid == request.auth.uid
         && request.resource.data.updatedByUid == request.auth.uid
@@ -170,25 +188,43 @@ service cloud.firestore {
           )
         );
 
-      allow update: if isAuthorizedStaff()
+      allow update: if !('deletedAt' in resource.data)
         && isValidOrderData(request.resource.data)
         && request.resource.data.orderId == resource.data.orderId
         && request.resource.data.createdByUid == resource.data.createdByUid
         && request.resource.data.createdAt == resource.data.createdAt
         && request.resource.data.updatedByUid == request.auth.uid
         && (
+          // Standard staff/admin edit or balance payment (cannot set deletedAt)
           (
-            request.resource.data.amountPaidUgx == resource.data.amountPaidUgx
+            isAuthorizedStaff()
+            && !('deletedAt' in request.resource.data)
+            && (
+              (
+                request.resource.data.amountPaidUgx == resource.data.amountPaidUgx
+                && request.resource.data.get('lastPaymentId', '') == resource.data.get('lastPaymentId', '')
+              )
+              || hasMatchingBalancePaymentAfter(orderDocId, resource.data, request.resource.data)
+            )
+          )
+          // Admin-only soft-delete: records who deleted and when, preserves payment/order history
+          || (
+            isAdmin()
+            && isNonEmptyString(request.resource.data.deletedAt)
+            && request.resource.data.deletedByUid == request.auth.uid
+            && isNonEmptyString(request.resource.data.deletedByEmail)
+            && request.resource.data.amountPaidUgx == resource.data.amountPaidUgx
+            && request.resource.data.totalPriceUgx == resource.data.totalPriceUgx
+            && request.resource.data.balanceUgx == resource.data.balanceUgx
             && request.resource.data.get('lastPaymentId', '') == resource.data.get('lastPaymentId', '')
           )
-          || hasMatchingBalancePaymentAfter(orderDocId, resource.data, request.resource.data)
         );
 
-      // Order deletion is disabled until automated/verified backup safeguards are enforced.
+      // Physical deletion is disabled; admin soft-deletes orders so payment history is retained.
       allow delete: if false;
     }
 
-    // Individual payment transactions (order deposits, later balance payments, walk-in sales).
+    // Individual payment transactions (retained for history; never deleted).
     match /payments/{paymentId} {
       allow read: if isAuthorizedStaff();
 
@@ -201,10 +237,19 @@ service cloud.firestore {
           || hasMatchingOrderAfter(paymentId, request.resource.data)
         );
 
-      allow update: if false;
+      allow update, delete: if false;
+    }
 
-      // Payment deletion is disabled until automated/verified backup safeguards are enforced.
-      allow delete: if false;
+    // Daily cash-flow entries (expenses & other item sales). Immutable audit records.
+    match /cashFlowEntries/{entryId} {
+      allow read: if isAuthorizedStaff();
+
+      allow create: if isAuthorizedStaff()
+        && isValidCashFlowData(request.resource.data)
+        && request.resource.data.entryId == entryId
+        && request.resource.data.recordedByUid == request.auth.uid;
+
+      allow update, delete: if false;
     }
 
     // Deny everything else by default.

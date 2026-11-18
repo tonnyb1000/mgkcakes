@@ -10,13 +10,18 @@ import {
 import type {
   CakeOrder,
   CakeOrderInput,
+  CashFlowEntry,
+  CashFlowEntryInput,
+  PaymentMethod,
   PaymentTransaction,
   PickupStatus,
   StaffUser,
   WalkInSaleInput,
 } from '../types/order';
 import {
+  generateCashFlowId,
   generatePaymentId,
+  validateCashFlowEntry,
   validateWalkInSale,
 } from '../utils/collections';
 import { diffOrderInputAgainstSaved } from '../utils/reconcileOrder';
@@ -35,12 +40,18 @@ class TestMemoryOrderRepository implements OrderRepository {
   readonly configured = true;
   private orders: CakeOrder[];
   private payments: PaymentTransaction[];
+  private cashFlowEntries: CashFlowEntry[];
   private currentUser: StaffUser | null = null;
   private listeners = new Set<(user: StaffUser | null, error?: string) => void>();
 
-  constructor(initialOrders: CakeOrder[], initialPayments: PaymentTransaction[] = []) {
+  constructor(
+    initialOrders: CakeOrder[],
+    initialPayments: PaymentTransaction[] = [],
+    initialCashFlowEntries: CashFlowEntry[] = []
+  ) {
     this.orders = [...initialOrders];
     this.payments = [...initialPayments];
+    this.cashFlowEntries = [...initialCashFlowEntries];
   }
 
   subscribeAuth(callback: (user: StaffUser | null, error?: string) => void): () => void {
@@ -83,6 +94,11 @@ class TestMemoryOrderRepository implements OrderRepository {
   async listPayments(user: StaffUser | null): Promise<PaymentTransaction[]> {
     if (!user) throw new Error('Access denied');
     return [...this.payments];
+  }
+
+  async listCashFlowEntries(user: StaffUser | null): Promise<CashFlowEntry[]> {
+    if (!user) throw new Error('Access denied');
+    return [...this.cashFlowEntries];
   }
 
   async createOrder(
@@ -147,6 +163,7 @@ class TestMemoryOrderRepository implements OrderRepository {
         {
           paymentId,
           kind: 'order_deposit',
+          paymentMethod: input.depositPaymentMethod ?? 'cash',
           orderId: order.orderId,
           customerName: order.customerName,
           description: order.description,
@@ -198,6 +215,29 @@ class TestMemoryOrderRepository implements OrderRepository {
     return updated;
   }
 
+  async deleteOrder(orderId: string, user: StaffUser | null): Promise<CakeOrder> {
+    if (!user || (user.role !== 'owner' && user.role !== 'admin')) {
+      throw new Error('Access denied: Only an admin can delete orders.');
+    }
+    const idx = this.orders.findIndex((o) => o.orderId === orderId);
+    if (idx === -1) throw new Error('Not found');
+    const existing = this.orders[idx];
+    if (existing.deletedAt) return existing;
+    const nowIso = new Date().toISOString();
+    const deleted: CakeOrder = {
+      ...existing,
+      deletedAt: nowIso,
+      deletedByUid: user.uid,
+      deletedByEmail: user.email,
+      deletedByName: user.displayName,
+      updatedAt: nowIso,
+      updatedByUid: user.uid,
+      updatedByEmail: user.email,
+    };
+    this.orders = [...this.orders.slice(0, idx), deleted, ...this.orders.slice(idx + 1)];
+    return deleted;
+  }
+
   async updatePickupStatus(
     orderId: string,
     status: PickupStatus,
@@ -221,7 +261,8 @@ class TestMemoryOrderRepository implements OrderRepository {
     orderId: string,
     amountUgx: number,
     user: StaffUser | null,
-    idempotencyPaymentId?: string
+    idempotencyPaymentId?: string,
+    paymentMethod: PaymentMethod = 'cash'
   ): Promise<{ order: CakeOrder; payment: PaymentTransaction }> {
     if (!user) throw new Error('Access denied');
     const cleanAmount = Math.round(amountUgx);
@@ -254,6 +295,7 @@ class TestMemoryOrderRepository implements OrderRepository {
     const payment: PaymentTransaction = {
       paymentId,
       kind: 'order_balance',
+      paymentMethod,
       orderId,
       customerName: existing.customerName,
       description: existing.description,
@@ -285,6 +327,7 @@ class TestMemoryOrderRepository implements OrderRepository {
     const sale: PaymentTransaction = {
       paymentId,
       kind: 'walk_in',
+      paymentMethod: input.paymentMethod,
       orderId: '',
       customerName: 'Walk-in Customer',
       description: input.description.trim(),
@@ -298,6 +341,35 @@ class TestMemoryOrderRepository implements OrderRepository {
     };
     this.payments = [sale, ...this.payments];
     return sale;
+  }
+
+  async recordCashFlowEntry(
+    input: CashFlowEntryInput,
+    user: StaffUser | null,
+    idempotencyEntryId?: string
+  ): Promise<CashFlowEntry> {
+    if (!user) throw new Error('Access denied');
+    const errors = validateCashFlowEntry(input);
+    const first = Object.values(errors)[0];
+    if (first) throw new Error(first);
+    const entryId = idempotencyEntryId || generateCashFlowId(input.entryDate);
+    const existing = this.cashFlowEntries.find((e) => e.entryId === entryId);
+    if (existing) return existing;
+    const entry: CashFlowEntry = {
+      entryId,
+      type: input.type,
+      paymentMethod: input.paymentMethod,
+      description: input.description.trim(),
+      amountUgx: Math.round(input.amountUgx),
+      entryDate: input.entryDate,
+      entryTime: input.entryTime,
+      createdAt: new Date().toISOString(),
+      recordedByUid: user.uid,
+      recordedByEmail: user.email,
+      recordedByName: user.displayName,
+    };
+    this.cashFlowEntries = [entry, ...this.cashFlowEntries];
+    return entry;
   }
 
   async deleteArchivedOrders(_orderIds: string[], user: StaffUser | null): Promise<number> {
@@ -658,10 +730,13 @@ describe('Cake Order Tracker workflows & access control', () => {
       listOrders: (u) => baseRepo.listOrders(u),
       getOrderById: (id, u) => baseRepo.getOrderById(id, u),
       listPayments: (u) => baseRepo.listPayments(u),
+      listCashFlowEntries: (u) => baseRepo.listCashFlowEntries(u),
       updateOrder: (id, inp, u, exp) => baseRepo.updateOrder(id, inp, u, exp),
       updatePickupStatus: (id, st, u) => baseRepo.updatePickupStatus(id, st, u),
-      recordOrderPayment: (id, amt, u, pid) => baseRepo.recordOrderPayment(id, amt, u, pid),
+      deleteOrder: (id, u) => baseRepo.deleteOrder(id, u),
+      recordOrderPayment: (id, amt, u, pid, pm) => baseRepo.recordOrderPayment(id, amt, u, pid, pm),
       recordWalkInSale: (inp, u, pid) => baseRepo.recordWalkInSale(inp, u, pid),
+      recordCashFlowEntry: (inp, u, eid) => baseRepo.recordCashFlowEntry(inp, u, eid),
       deleteArchivedOrders: (ids, u) => baseRepo.deleteArchivedOrders(ids, u),
       async createOrder(input, staffUser, idempotency) {
         const created = await baseRepo.createOrder(input, staffUser, idempotency);
@@ -732,10 +807,13 @@ describe('Cake Order Tracker workflows & access control', () => {
       listOrders: (u) => baseRepo.listOrders(u),
       getOrderById: (id, u) => baseRepo.getOrderById(id, u),
       listPayments: (u) => baseRepo.listPayments(u),
+      listCashFlowEntries: (u) => baseRepo.listCashFlowEntries(u),
       updateOrder: (id, inp, u, exp) => baseRepo.updateOrder(id, inp, u, exp),
       updatePickupStatus: (id, st, u) => baseRepo.updatePickupStatus(id, st, u),
-      recordOrderPayment: (id, amt, u, pid) => baseRepo.recordOrderPayment(id, amt, u, pid),
+      deleteOrder: (id, u) => baseRepo.deleteOrder(id, u),
+      recordOrderPayment: (id, amt, u, pid, pm) => baseRepo.recordOrderPayment(id, amt, u, pid, pm),
       recordWalkInSale: (inp, u, pid) => baseRepo.recordWalkInSale(inp, u, pid),
+      recordCashFlowEntry: (inp, u, eid) => baseRepo.recordCashFlowEntry(inp, u, eid),
       deleteArchivedOrders: (ids, u) => baseRepo.deleteArchivedOrders(ids, u),
       async createOrder(input, staffUser, idempotency) {
         const created = await baseRepo.createOrder(input, staffUser, idempotency);
@@ -805,10 +883,13 @@ describe('Cake Order Tracker workflows & access control', () => {
       listOrders: (u) => baseRepo.listOrders(u),
       getOrderById: (id, u) => baseRepo.getOrderById(id, u),
       listPayments: (u) => baseRepo.listPayments(u),
+      listCashFlowEntries: (u) => baseRepo.listCashFlowEntries(u),
       updateOrder: (id, inp, u, exp) => baseRepo.updateOrder(id, inp, u, exp),
       updatePickupStatus: (id, st, u) => baseRepo.updatePickupStatus(id, st, u),
-      recordOrderPayment: (id, amt, u, pid) => baseRepo.recordOrderPayment(id, amt, u, pid),
+      deleteOrder: (id, u) => baseRepo.deleteOrder(id, u),
+      recordOrderPayment: (id, amt, u, pid, pm) => baseRepo.recordOrderPayment(id, amt, u, pid, pm),
       recordWalkInSale: (inp, u, pid) => baseRepo.recordWalkInSale(inp, u, pid),
+      recordCashFlowEntry: (inp, u, eid) => baseRepo.recordCashFlowEntry(inp, u, eid),
       deleteArchivedOrders: (ids, u) => baseRepo.deleteArchivedOrders(ids, u),
       async createOrder(input, staffUser, idempotency) {
         const created = await baseRepo.createOrder(input, staffUser, idempotency);
@@ -913,5 +994,94 @@ describe('Cake Order Tracker workflows & access control', () => {
     // Choose Reload Latest Order -> loads server version without overwriting
     await user.click(screen.getByRole('button', { name: /Reload Latest Order/i }));
     expect(screen.getByLabelText(/Cake Description/i)).toHaveValue('Concurrent server description');
+  });
+
+  it('restricts order deletion to admin, retains payment history excluded from daily totals, and tracks daily cash-flow', async () => {
+    const user = userEvent.setup();
+    const repo = new TestMemoryOrderRepository(makeTestOrders());
+    render(<App repository={repo} />);
+
+    // Staff cannot delete orders (neither in repo nor in UI)
+    await expect(
+      repo.deleteOrder('ORD-TEST-001', {
+        uid: 'staff-1',
+        email: 'staff@shop.example',
+        displayName: 'Staff User',
+        role: 'staff',
+        active: true,
+      })
+    ).rejects.toThrow(/Only an admin can delete orders/i);
+
+    await signInAs(user, 'staff@shop.example');
+    await user.click(await screen.findByRole('button', { name: /View Orders/i }));
+    await screen.findByText('Amina Namukasa');
+    expect(screen.queryByRole('button', { name: /Delete Order/i })).not.toBeInTheDocument();
+
+    // Staff records a Cash Expense (UGX 25,000) and a Mobile Money Other Item Sale (UGX 15,000) in Daily Cash-Flow
+    await user.click(screen.getByRole('button', { name: /Daily Collections/i }));
+    await user.type(screen.getByLabelText(/^Description \*/i), 'Cooking gas refill');
+    await user.type(screen.getByLabelText(/^Amount \(UGX\) \*/i), '25000');
+    await user.click(screen.getByRole('button', { name: /Record Expense/i }));
+
+    await user.selectOptions(screen.getByLabelText(/Transaction Type/i), 'other_sale');
+    await user.selectOptions(
+      screen.getByLabelText(/Payment Method/i, { selector: '#cf-method' }),
+      'mobile_money'
+    );
+    await user.type(screen.getByLabelText(/^Description \*/i), 'Birthday candles');
+    await user.type(screen.getByLabelText(/^Amount \(UGX\) \*/i), '15000');
+    await user.click(screen.getByRole('button', { name: /Record Other Sale/i }));
+
+    const cashTile = screen.getByLabelText(/Cash cash-flow/i);
+    expect(within(cashTile).getByText('UGX 0')).toBeInTheDocument();
+    expect(within(cashTile).getByText('UGX 25,000')).toBeInTheDocument();
+    expect(within(cashTile).getByText('-UGX 25,000')).toBeInTheDocument();
+
+    const momoTile = screen.getByLabelText(/Mobile Money cash-flow/i);
+    expect(within(momoTile).getByText('UGX 15,000')).toBeInTheDocument();
+    expect(within(momoTile).getByText('UGX 0')).toBeInTheDocument();
+    expect(within(momoTile).getByText('+UGX 15,000')).toBeInTheDocument();
+
+    const combinedTile = screen.getByLabelText(/Combined cash-flow total/i);
+    expect(within(combinedTile).getByText('UGX 15,000')).toBeInTheDocument();
+    expect(within(combinedTile).getByText('UGX 25,000')).toBeInTheDocument();
+    expect(within(combinedTile).getByText('-UGX 10,000')).toBeInTheDocument();
+    expect(screen.getAllByText(/Entered by Staff User/i)).toHaveLength(2);
+
+    // Sign out and sign in as Owner/Admin -> create an order with deposit, then delete it
+    await user.click(screen.getByRole('button', { name: /Sign out/i }));
+    await signInAs(user, 'owner@shop.example');
+
+    await user.click(await screen.findByRole('button', { name: /New Order/i }));
+    await user.type(screen.getByLabelText(/Customer Name/i), 'Deleted Order Test');
+    await user.type(screen.getByLabelText(/Phone Number/i), '0772777666');
+    await user.type(screen.getByLabelText(/Cake Description/i), 'Chocolate cake');
+    const tier1Quick = screen.getByRole('group', { name: /Quick prices for Tier 1/i });
+    await user.click(within(tier1Quick).getByRole('button', { name: '100,000' }));
+    const paidInput = screen.getByLabelText(/Deposit Paid \(UGX\)/i);
+    await user.clear(paidInput);
+    await user.type(paidInput, '60000');
+    await user.click(screen.getByRole('button', { name: /Save Order/i }));
+
+    const delCard = (await screen.findByText('Deleted Order Test')).closest('article')!;
+    await user.click(within(delCard).getByRole('button', { name: /Delete Order/i }));
+    await user.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: /Yes, Delete Order/i })
+    );
+
+    // Order moves to Deleted view showing who deleted it and when
+    expect(screen.queryByText('Deleted Order Test')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /^Deleted$/i }));
+    expect(await screen.findByText('Deleted Order Test')).toBeInTheDocument();
+    expect(screen.getByText(/Deleted by/i)).toBeInTheDocument();
+
+    // Daily Collections retains the payment record for history, but excludes UGX 60,000 from totals
+    await user.click(screen.getByRole('button', { name: /Daily Collections/i }));
+    const colSummary = screen.getByLabelText(/Daily collections summary/i);
+    expect(within(colSummary).getAllByText('UGX 0')).toHaveLength(4);
+    expect(
+      screen.getByText(/Retained Payment History for Deleted Orders \(Excluded from Totals\)/i)
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Order deleted by/i)).toBeInTheDocument();
   });
 });

@@ -15,6 +15,9 @@ import {
 import type {
   CakeOrder,
   CakeOrderInput,
+  CashFlowEntry,
+  CashFlowEntryInput,
+  PaymentMethod,
   PaymentTransaction,
   PickupStatus,
   StaffRole,
@@ -22,7 +25,9 @@ import type {
   WalkInSaleInput,
 } from '../types/order';
 import {
+  generateCashFlowId,
   generatePaymentId,
+  validateCashFlowEntry,
   validateWalkInSale,
 } from '../utils/collections';
 import { calculateBalanceUgx, validateOrderInput } from '../utils/currency';
@@ -56,6 +61,7 @@ export interface OrderRepository {
   listOrders(currentUser: StaffUser | null): Promise<CakeOrder[]>;
   getOrderById(orderId: string, currentUser: StaffUser | null): Promise<CakeOrder | null>;
   listPayments(currentUser: StaffUser | null): Promise<PaymentTransaction[]>;
+  listCashFlowEntries(currentUser: StaffUser | null): Promise<CashFlowEntry[]>;
   createOrder(
     input: CakeOrderInput,
     currentUser: StaffUser | null,
@@ -72,23 +78,41 @@ export interface OrderRepository {
     status: PickupStatus,
     currentUser: StaffUser | null
   ): Promise<CakeOrder>;
+  deleteOrder(orderId: string, currentUser: StaffUser | null): Promise<CakeOrder>;
   recordOrderPayment(
     orderId: string,
     amountUgx: number,
     currentUser: StaffUser | null,
-    idempotencyPaymentId?: string
+    idempotencyPaymentId?: string,
+    paymentMethod?: PaymentMethod
   ): Promise<{ order: CakeOrder; payment: PaymentTransaction }>;
   recordWalkInSale(
     input: WalkInSaleInput,
     currentUser: StaffUser | null,
     idempotencyPaymentId?: string
   ): Promise<PaymentTransaction>;
+  recordCashFlowEntry(
+    input: CashFlowEntryInput,
+    currentUser: StaffUser | null,
+    idempotencyEntryId?: string
+  ): Promise<CashFlowEntry>;
   deleteArchivedOrders(orderIds: string[], currentUser: StaffUser | null): Promise<number>;
 }
 
+function isAdminRole(role: StaffRole): boolean {
+  return role === 'owner' || role === 'admin';
+}
+
 function assertAuthorizedStaff(user: StaffUser | null): asserts user is StaffUser {
-  if (!user || !user.active || (user.role !== 'staff' && user.role !== 'owner')) {
+  if (!user || !user.active || !['staff', 'owner', 'admin'].includes(user.role)) {
     throw new Error('Access denied: You must be signed in as authorised staff.');
+  }
+}
+
+function assertAdmin(user: StaffUser | null): asserts user is StaffUser {
+  assertAuthorizedStaff(user);
+  if (!isAdminRole(user.role)) {
+    throw new Error('Access denied: Only an admin can delete orders.');
   }
 }
 
@@ -126,6 +150,10 @@ export class UnconfiguredOrderRepository implements OrderRepository {
     throw new Error('Firebase is not configured. Access is blocked.');
   }
 
+  async listCashFlowEntries(): Promise<CashFlowEntry[]> {
+    throw new Error('Firebase is not configured. Access is blocked.');
+  }
+
   async createOrder(): Promise<CakeOrder> {
     throw new Error('Firebase is not configured. Access is blocked.');
   }
@@ -138,11 +166,19 @@ export class UnconfiguredOrderRepository implements OrderRepository {
     throw new Error('Firebase is not configured. Access is blocked.');
   }
 
+  async deleteOrder(): Promise<CakeOrder> {
+    throw new Error('Firebase is not configured. Access is blocked.');
+  }
+
   async recordOrderPayment(): Promise<{ order: CakeOrder; payment: PaymentTransaction }> {
     throw new Error('Firebase is not configured. Access is blocked.');
   }
 
   async recordWalkInSale(): Promise<PaymentTransaction> {
+    throw new Error('Firebase is not configured. Access is blocked.');
+  }
+
+  async recordCashFlowEntry(): Promise<CashFlowEntry> {
     throw new Error('Firebase is not configured. Access is blocked.');
   }
 
@@ -180,7 +216,7 @@ export class FirestoreOrderRepository implements OrderRepository {
           return;
         }
         const data = staffSnap.data();
-        if (data.active !== true || (data.role !== 'staff' && data.role !== 'owner')) {
+        if (data.active !== true || !['staff', 'owner', 'admin'].includes(data.role)) {
           callback(
             null,
             'Your staff account is inactive or lacks a valid role. Contact the shop owner.'
@@ -247,6 +283,14 @@ export class FirestoreOrderRepository implements OrderRepository {
     const q = query(collection(db, 'payments'), orderBy('receivedDate', 'desc'));
     const snap = await getDocs(q);
     return snap.docs.map((d) => d.data() as PaymentTransaction);
+  }
+
+  async listCashFlowEntries(currentUser: StaffUser | null): Promise<CashFlowEntry[]> {
+    assertAuthorizedStaff(currentUser);
+    const { db } = this.getServices();
+    const q = query(collection(db, 'cashFlowEntries'), orderBy('entryDate', 'desc'));
+    const snap = await getDocs(q);
+    return snap.docs.map((d) => d.data() as CashFlowEntry);
   }
 
   async createOrder(
@@ -326,6 +370,7 @@ export class FirestoreOrderRepository implements OrderRepository {
         const depositTx: PaymentTransaction = {
           paymentId,
           kind: 'order_deposit',
+          paymentMethod: input.depositPaymentMethod ?? 'cash',
           orderId,
           customerName: order.customerName,
           description: order.description,
@@ -452,11 +497,53 @@ export class FirestoreOrderRepository implements OrderRepository {
     });
   }
 
+  async deleteOrder(orderId: string, currentUser: StaffUser | null): Promise<CakeOrder> {
+    assertAdmin(currentUser);
+    const { db } = this.getServices();
+    const ref = doc(db, 'orders', orderId);
+
+    return runTransaction(db, async (tx) => {
+      const existingSnap = await tx.get(ref);
+      if (!existingSnap.exists()) {
+        throw new Error(`Order ${orderId} was not found.`);
+      }
+      const existing = existingSnap.data() as CakeOrder;
+      if (existing.deletedAt) {
+        return existing;
+      }
+
+      const nowIso = new Date().toISOString();
+      const deletedOrder: CakeOrder = {
+        ...existing,
+        deletedAt: nowIso,
+        deletedByUid: currentUser.uid,
+        deletedByEmail: currentUser.email,
+        deletedByName: currentUser.displayName,
+        updatedAt: nowIso,
+        updatedByUid: currentUser.uid,
+        updatedByEmail: currentUser.email,
+      };
+
+      tx.update(ref, {
+        deletedAt: nowIso,
+        deletedByUid: currentUser.uid,
+        deletedByEmail: currentUser.email,
+        deletedByName: currentUser.displayName,
+        updatedAt: nowIso,
+        updatedByUid: currentUser.uid,
+        updatedByEmail: currentUser.email,
+      });
+
+      return deletedOrder;
+    });
+  }
+
   async recordOrderPayment(
     orderId: string,
     amountUgx: number,
     currentUser: StaffUser | null,
-    idempotencyPaymentId?: string
+    idempotencyPaymentId?: string,
+    paymentMethod: PaymentMethod = 'cash'
   ): Promise<{ order: CakeOrder; payment: PaymentTransaction }> {
     assertAuthorizedStaff(currentUser);
     const cleanAmount = Math.round(amountUgx);
@@ -512,6 +599,7 @@ export class FirestoreOrderRepository implements OrderRepository {
       const payment: PaymentTransaction = {
         paymentId,
         kind: 'order_balance',
+        paymentMethod,
         orderId,
         customerName: existing.customerName,
         description: existing.description,
@@ -558,6 +646,7 @@ export class FirestoreOrderRepository implements OrderRepository {
     const sale: PaymentTransaction = {
       paymentId,
       kind: 'walk_in',
+      paymentMethod: input.paymentMethod,
       orderId: '',
       customerName: 'Walk-in Customer',
       description: input.description.trim(),
@@ -586,6 +675,55 @@ export class FirestoreOrderRepository implements OrderRepository {
       }
       tx.set(paymentRef, sale);
       return sale;
+    });
+  }
+
+  async recordCashFlowEntry(
+    input: CashFlowEntryInput,
+    currentUser: StaffUser | null,
+    idempotencyEntryId?: string
+  ): Promise<CashFlowEntry> {
+    assertAuthorizedStaff(currentUser);
+    const errors = validateCashFlowEntry(input);
+    const firstError = Object.values(errors)[0];
+    if (firstError) {
+      throw new Error(firstError);
+    }
+
+    const { db } = this.getServices();
+    const entryId = idempotencyEntryId || generateCashFlowId(input.entryDate);
+    const entryRef = doc(db, 'cashFlowEntries', entryId);
+    const nowIso = new Date().toISOString();
+
+    const entry: CashFlowEntry = {
+      entryId,
+      type: input.type,
+      paymentMethod: input.paymentMethod,
+      description: input.description.trim(),
+      amountUgx: Math.round(input.amountUgx),
+      entryDate: input.entryDate,
+      entryTime: input.entryTime,
+      createdAt: nowIso,
+      recordedByUid: currentUser.uid,
+      recordedByEmail: currentUser.email,
+      recordedByName: currentUser.displayName,
+    };
+
+    return runTransaction(db, async (tx) => {
+      const existing = await tx.get(entryRef);
+      if (existing.exists()) {
+        const existingEntry = existing.data() as CashFlowEntry;
+        if (
+          existingEntry.type === entry.type &&
+          existingEntry.amountUgx === entry.amountUgx &&
+          existingEntry.description === entry.description
+        ) {
+          return existingEntry;
+        }
+        throw new Error('This cash-flow entry ID is already in use.');
+      }
+      tx.set(entryRef, entry);
+      return entry;
     });
   }
 

@@ -486,4 +486,87 @@ describe('Firestore security rules & emulator consistency', () => {
     expect(updatedSnap.data()!.amountPaidUgx).toBe(60000);
     expect(updatedSnap.data()!.lastPaymentId).toBe(paymentId);
   });
+
+  it('restricts order soft-deletion to admin, blocks edits on deleted orders, and enforces cash-flow rules', async () => {
+    const anonDb = testEnv.unauthenticatedContext().firestore();
+    const staffDb = testEnv.authenticatedContext('staff-uid').firestore();
+    const ownerDb = testEnv.authenticatedContext('owner-uid').firestore();
+    const orderRef = doc(staffDb, 'orders', 'ORD-20261117-EXIST1');
+    const ownerOrderRef = doc(ownerDb, 'orders', 'ORD-20261117-EXIST1');
+
+    // Staff cannot soft-delete an order
+    await assertFails(
+      updateDoc(orderRef, {
+        deletedAt: '2026-11-18T16:30:00+03:00',
+        deletedByUid: 'staff-uid',
+        deletedByEmail: 'staff@shop.example',
+        updatedAt: '2026-11-18T16:30:00+03:00',
+        updatedByUid: 'staff-uid',
+      })
+    );
+
+    // Admin/Owner can soft-delete an order while payment history remains retained
+    await assertSucceeds(
+      updateDoc(ownerOrderRef, {
+        deletedAt: '2026-11-18T16:31:00+03:00',
+        deletedByUid: 'owner-uid',
+        deletedByEmail: 'owner@shop.example',
+        deletedByName: 'Shop Owner',
+        updatedAt: '2026-11-18T16:31:00+03:00',
+        updatedByUid: 'owner-uid',
+      })
+    );
+
+    // Retained payment still exists for history
+    const retainedPay = await getDoc(doc(staffDb, 'payments', 'PAY-20261117-EXIST1'));
+    expect(retainedPay.exists()).toBe(true);
+
+    // Deleted order cannot be edited afterward
+    await assertFails(
+      updateDoc(orderRef, {
+        description: 'Attempt edit after delete',
+        updatedAt: '2026-11-18T16:32:00+03:00',
+        updatedByUid: 'staff-uid',
+      })
+    );
+
+    // Daily cash-flow entries: staff can create valid expense & other_sale, cannot spoof/update/delete
+    const validExpense = {
+      entryId: 'CF-20261118-EXP001',
+      type: 'expense',
+      paymentMethod: 'mobile_money',
+      description: 'Cooking gas',
+      amountUgx: 45000,
+      entryDate: '2026-11-18',
+      entryTime: '14:00',
+      createdAt: '2026-11-18T14:00:00+03:00',
+      recordedByUid: 'staff-uid',
+      recordedByEmail: 'staff@shop.example',
+      recordedByName: 'Staff Member',
+    };
+
+    await assertFails(setDoc(doc(anonDb, 'cashFlowEntries', 'CF-20261118-EXP001'), validExpense));
+    await assertFails(
+      setDoc(doc(staffDb, 'cashFlowEntries', 'CF-20261118-BADMETH'), {
+        ...validExpense,
+        entryId: 'CF-20261118-BADMETH',
+        paymentMethod: 'crypto',
+      })
+    );
+    await assertFails(
+      setDoc(doc(staffDb, 'cashFlowEntries', 'CF-20261118-BAD001'), {
+        ...validExpense,
+        entryId: 'CF-20261118-BAD001',
+        recordedByUid: 'owner-uid',
+      })
+    );
+    await assertSucceeds(
+      setDoc(doc(staffDb, 'cashFlowEntries', 'CF-20261118-EXP001'), validExpense)
+    );
+    await assertFails(
+      updateDoc(doc(staffDb, 'cashFlowEntries', 'CF-20261118-EXP001'), { amountUgx: 1000 })
+    );
+    await assertFails(deleteDoc(doc(staffDb, 'cashFlowEntries', 'CF-20261118-EXP001')));
+    await assertFails(deleteDoc(doc(ownerDb, 'cashFlowEntries', 'CF-20261118-EXP001')));
+  });
 });

@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import type { CakeOrder, PaymentTransaction, PickupStatus } from '../types/order';
+import type { CakeOrder, PaymentTransaction, PickupStatus, StaffUser } from '../types/order';
 import { getUnrecordedHistoricalAmount } from '../utils/collections';
 import { formatUgx } from '../utils/currency';
 import {
@@ -10,17 +10,19 @@ import {
 } from '../utils/dateKampala';
 import { ConfirmModal } from './ConfirmModal';
 
-type QuickView = 'all' | 'today' | 'tomorrow' | 'waiting' | 'picked_up';
+type QuickView = 'all' | 'today' | 'tomorrow' | 'waiting' | 'picked_up' | 'deleted';
 type DateFieldFilter = 'pickupDate' | 'orderDate';
 
 interface OrdersPageProps {
   orders: CakeOrder[];
   payments?: PaymentTransaction[];
+  user: StaffUser;
   loading: boolean;
   error: string | null;
   onRefresh: () => void;
   onEditOrder: (order: CakeOrder) => void;
   onTogglePickupStatus: (order: CakeOrder, nextStatus: PickupStatus) => Promise<void>;
+  onDeleteOrder?: (order: CakeOrder) => Promise<void>;
   onCreateNew: () => void;
 }
 
@@ -44,11 +46,13 @@ function getMiniCylinderWidth(tierNumber: number, count: number): number {
 export const OrdersPage: React.FC<OrdersPageProps> = ({
   orders,
   payments = [],
+  user,
   loading,
   error,
   onRefresh,
   onEditOrder,
   onTogglePickupStatus,
+  onDeleteOrder,
   onCreateNew,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
@@ -59,8 +63,11 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
     order: CakeOrder;
     nextStatus: PickupStatus;
   } | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<CakeOrder | null>(null);
   const [toggling, setToggling] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
+  const isAdmin = user.role === 'owner' || user.role === 'admin';
   const todayKampala = getKampalaToday();
   const tomorrowKampala = getKampalaTomorrow();
 
@@ -68,6 +75,13 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
     const q = searchQuery.trim().toLowerCase();
 
     return orders.filter((order) => {
+      const isDeleted = Boolean(order.deletedAt);
+      if (quickView === 'deleted') {
+        if (!isDeleted) return false;
+      } else if (isDeleted) {
+        return false;
+      }
+
       if (q) {
         const matchesSearch =
           order.orderId.toLowerCase().includes(q) ||
@@ -98,6 +112,17 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
       setPendingToggle(null);
     } finally {
       setToggling(false);
+    }
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!pendingDelete || !onDeleteOrder) return;
+    setDeleting(true);
+    try {
+      await onDeleteOrder(pendingDelete);
+      setPendingDelete(null);
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -138,6 +163,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
               ['tomorrow', 'Tomorrow'],
               ['waiting', 'Waiting'],
               ['picked_up', 'Picked up'],
+              ['deleted', 'Deleted'],
             ] as const
           ).map(([key, label]) => (
             <button
@@ -234,21 +260,28 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
       {!loading && !error && filteredOrders.length > 0 && (
         <div className="orders-list" aria-live="polite">
           {filteredOrders.map((order) => {
+            const isDeleted = Boolean(order.deletedAt);
             const isPickedUp = order.pickupStatus === 'picked_up';
             const nextStatus: PickupStatus = isPickedUp ? 'waiting' : 'picked_up';
             const unrecordedHistorical =
-              payments.length > 0 ? getUnrecordedHistoricalAmount(order, payments) : 0;
+              !isDeleted && payments.length > 0
+                ? getUnrecordedHistoricalAmount(order, payments)
+                : 0;
 
             return (
-              <article key={order.orderId} className="card order-card">
+              <article key={order.orderId} className={`card order-card ${isDeleted ? 'order-card-deleted' : ''}`}>
                 <div className="order-status-strip">
-                  <span
-                    className={`status-badge ${
-                      isPickedUp ? 'status-picked-up' : 'status-waiting'
-                    }`}
-                  >
-                    {isPickedUp ? 'Picked up' : 'Waiting for pickup'}
-                  </span>
+                  {isDeleted ? (
+                    <span className="status-badge status-deleted">Deleted</span>
+                  ) : (
+                    <span
+                      className={`status-badge ${
+                        isPickedUp ? 'status-picked-up' : 'status-waiting'
+                      }`}
+                    >
+                      {isPickedUp ? 'Picked up' : 'Waiting for pickup'}
+                    </span>
+                  )}
                   {unrecordedHistorical > 0 && (
                     <span className="status-badge status-review">
                       Historical payment needs review
@@ -264,6 +297,14 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                       : `Balance: ${formatUgx(order.balanceUgx)}`}
                   </span>
                 </div>
+
+                {isDeleted && order.deletedAt && (
+                  <div className="notice notice-warning" role="status">
+                    Deleted by <strong>{order.deletedByName || order.deletedByEmail}</strong> on{' '}
+                    {formatTimestampKampala(order.deletedAt)}. Payment records are retained for
+                    history and excluded from daily collection totals.
+                  </div>
+                )}
 
                 <div className="order-card-top">
                   <div>
@@ -370,22 +411,33 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                   </div>
                 </div>
 
-                <div className="order-card-actions">
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-sm"
-                    onClick={() => onEditOrder(order)}
-                  >
-                    View or Edit Order
-                  </button>
-                  <button
-                    type="button"
-                    className={`btn btn-sm ${isPickedUp ? 'btn-ghost' : 'btn-primary'}`}
-                    onClick={() => setPendingToggle({ order, nextStatus })}
-                  >
-                    {isPickedUp ? 'Mark Waiting Again' : 'Mark Picked Up'}
-                  </button>
-                </div>
+                {!isDeleted && (
+                  <div className="order-card-actions">
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => onEditOrder(order)}
+                    >
+                      View or Edit Order
+                    </button>
+                    <button
+                      type="button"
+                      className={`btn btn-sm ${isPickedUp ? 'btn-ghost' : 'btn-primary'}`}
+                      onClick={() => setPendingToggle({ order, nextStatus })}
+                    >
+                      {isPickedUp ? 'Mark Waiting Again' : 'Mark Picked Up'}
+                    </button>
+                    {isAdmin && onDeleteOrder && (
+                      <button
+                        type="button"
+                        className="btn btn-danger btn-sm"
+                        onClick={() => setPendingDelete(order)}
+                      >
+                        Delete Order
+                      </button>
+                    )}
+                  </div>
+                )}
               </article>
             );
           })}
@@ -416,6 +468,21 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
         busy={toggling}
         onConfirm={handleConfirmToggle}
         onCancel={() => setPendingToggle(null)}
+      />
+
+      <ConfirmModal
+        open={Boolean(pendingDelete)}
+        title="Delete Order?"
+        message={
+          pendingDelete
+            ? `Delete order ${pendingDelete.orderId} for ${pendingDelete.customerName}? Payment records will be retained for history, but excluded from daily collection totals (including past days).`
+            : ''
+        }
+        confirmLabel="Yes, Delete Order"
+        danger
+        busy={deleting}
+        onConfirm={handleConfirmDelete}
+        onCancel={() => setPendingDelete(null)}
       />
     </section>
   );

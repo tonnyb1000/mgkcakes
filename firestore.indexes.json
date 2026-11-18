@@ -23,6 +23,14 @@
         { "fieldPath": "receivedDate", "order": "DESCENDING" },
         { "fieldPath": "receivedTime", "order": "DESCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "cashFlowEntries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "entryDate", "order": "DESCENDING" },
+        { "fieldPath": "entryTime", "order": "DESCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

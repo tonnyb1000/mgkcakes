@@ -11,6 +11,9 @@ import { createOrderRepository, type OrderRepository } from './services/orderRep
 import type {
   CakeOrder,
   CakeOrderInput,
+  CashFlowEntry,
+  CashFlowEntryInput,
+  PaymentMethod,
   PaymentTransaction,
   PickupStatus,
   StaffUser,
@@ -35,6 +38,7 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
 
   const [orders, setOrders] = useState<CakeOrder[]>([]);
   const [payments, setPayments] = useState<PaymentTransaction[]>([]);
+  const [cashFlowEntries, setCashFlowEntries] = useState<CashFlowEntry[]>([]);
   const [dataLoading, setDataLoading] = useState(false);
   const [dataError, setDataError] = useState<string | null>(null);
   const [bannerMessage, setBannerMessage] = useState<string | null>(null);
@@ -52,17 +56,20 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
     if (!user || !repo.configured) {
       setOrders([]);
       setPayments([]);
+      setCashFlowEntries([]);
       return;
     }
     setDataLoading(true);
     setDataError(null);
     try {
-      const [orderList, paymentList] = await Promise.all([
+      const [orderList, paymentList, cashFlowList] = await Promise.all([
         repo.listOrders(user),
         repo.listPayments(user),
+        repo.listCashFlowEntries(user),
       ]);
       setOrders(orderList);
       setPayments(paymentList);
+      setCashFlowEntries(cashFlowList);
     } catch (err) {
       setDataError(err instanceof Error ? err.message : 'Failed to load data.');
     } finally {
@@ -138,13 +145,15 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
   const handleRecordOrderPayment = async (
     orderId: string,
     amountUgx: number,
-    idempotencyPaymentId: string
+    idempotencyPaymentId: string,
+    paymentMethod: PaymentMethod
   ) => {
     const { order: updatedOrder, payment } = await repo.recordOrderPayment(
       orderId,
       amountUgx,
       user,
-      idempotencyPaymentId
+      idempotencyPaymentId,
+      paymentMethod
     );
     setOrders((prev) => prev.map((o) => (o.orderId === orderId ? updatedOrder : o)));
     setEditingOrder((prev) => (prev?.orderId === orderId ? updatedOrder : prev));
@@ -158,6 +167,25 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
     const sale = await repo.recordWalkInSale(input, user, idempotencyPaymentId);
     setPayments((prev) => [sale, ...prev]);
     setBannerMessage(`Walk-in sale recorded (${sale.description}).`);
+  };
+
+  const handleRecordCashFlowEntry = async (
+    input: CashFlowEntryInput,
+    idempotencyEntryId: string
+  ) => {
+    const entry = await repo.recordCashFlowEntry(input, user, idempotencyEntryId);
+    setCashFlowEntries((prev) => [entry, ...prev]);
+    setBannerMessage(
+      `${entry.type === 'expense' ? 'Expense' : 'Other item sale'} recorded (${entry.description}).`
+    );
+  };
+
+  const handleDeleteOrder = async (order: CakeOrder) => {
+    const deleted = await repo.deleteOrder(order.orderId, user);
+    setOrders((prev) => prev.map((o) => (o.orderId === order.orderId ? deleted : o)));
+    setBannerMessage(
+      `Order ${deleted.orderId} deleted. Payment records are retained for history and excluded from daily totals.`
+    );
   };
 
   const handleTogglePickupStatus = async (order: CakeOrder, nextStatus: PickupStatus) => {
@@ -279,11 +307,13 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
             <SalesCollectionsPage
               orders={orders}
               payments={payments}
+              cashFlowEntries={cashFlowEntries}
               user={user}
               loading={dataLoading}
               error={dataError}
               onRefresh={loadData}
               onRecordWalkInSale={handleRecordWalkInSale}
+              onRecordCashFlowEntry={handleRecordCashFlowEntry}
             />
           ) : activeTab === 'archive' ? (
             <ArchivePage
@@ -295,6 +325,7 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
             <OrdersPage
               orders={orders}
               payments={payments}
+              user={user}
               loading={dataLoading}
               error={dataError}
               onRefresh={loadData}
@@ -303,6 +334,7 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
                 setEditingOrder(order);
               }}
               onTogglePickupStatus={handleTogglePickupStatus}
+              onDeleteOrder={handleDeleteOrder}
               onCreateNew={() => handleTabChange('new')}
             />
           ) : (
@@ -356,7 +388,7 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
                 </div>
               </div>
 
-              {user.role === 'owner' && (
+              {(user.role === 'owner' || user.role === 'admin') && (
                 <div className="card owner-tools-card">
                   <div className="owner-tools-row">
                     <div>

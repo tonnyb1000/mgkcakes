@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   getUnrecordedHistoricalAmount,
+  summarizeDailyCashFlow,
   summarizeDailyCollections,
+  validateCashFlowEntry,
   validateWalkInSale,
 } from '../utils/collections';
 import {
@@ -242,10 +244,163 @@ describe('Daily Collections & walk-in validation', () => {
     const bad = validateWalkInSale({
       description: '',
       amountUgx: 0,
+      paymentMethod: 'cash',
       receivedDate: '2026-11-18',
       receivedTime: '12:00',
     });
     expect(bad.description).toBeDefined();
     expect(bad.amountUgx).toBeDefined();
+  });
+
+  it('excludes deleted orders from daily collections, separates cash and mobile money, and does not guess older records', () => {
+    const deletedOrder: CakeOrder = {
+      ...makeValidInput({ totalPriceUgx: 200000, amountPaidUgx: 100000 }),
+      orderId: 'ORD-DEL-1',
+      orderDate: '2026-11-10',
+      pickupDate: '2026-11-15',
+      balanceUgx: 100000,
+      pickupStatus: 'waiting',
+      createdAt: '2026-11-10T09:00:00+03:00',
+      updatedAt: '2026-11-18T12:00:00+03:00',
+      createdByUid: 'u1',
+      createdByEmail: 's@shop.example',
+      updatedByUid: 'admin1',
+      updatedByEmail: 'admin@shop.example',
+      deletedAt: '2026-11-18T12:00:00+03:00',
+      deletedByUid: 'admin1',
+      deletedByEmail: 'admin@shop.example',
+      deletedByName: 'Admin User',
+    };
+
+    const payments = [
+      {
+        paymentId: 'PAY-DEL-1',
+        kind: 'order_deposit' as const,
+        paymentMethod: 'cash' as const,
+        orderId: 'ORD-DEL-1',
+        customerName: 'Deleted Customer',
+        description: 'Cake',
+        amountUgx: 100000,
+        receivedDate: '2026-11-10',
+        receivedTime: '09:00',
+        receivedAt: '2026-11-10T09:00:00+03:00',
+        recordedByUid: 'u1',
+        recordedByEmail: 's@shop.example',
+        recordedByName: 'Staff',
+      },
+      {
+        paymentId: 'PAY-KEEP-1',
+        kind: 'order_balance' as const,
+        paymentMethod: 'mobile_money' as const,
+        orderId: 'ORD-ACTIVE-1',
+        customerName: 'Active Customer',
+        description: 'Active Cake',
+        amountUgx: 60000,
+        receivedDate: '2026-11-10',
+        receivedTime: '11:00',
+        receivedAt: '2026-11-10T11:00:00+03:00',
+        recordedByUid: 'u1',
+        recordedByEmail: 's@shop.example',
+        recordedByName: 'Staff',
+      },
+      {
+        paymentId: 'PAY-OLD-NOMETHOD',
+        kind: 'walk_in' as const,
+        // Older record with no paymentMethod -> must NOT be guessed into cash or mobile_money
+        orderId: '',
+        customerName: 'Walk-in Customer',
+        description: 'Older walk-in',
+        amountUgx: 20000,
+        receivedDate: '2026-11-10',
+        receivedTime: '11:30',
+        receivedAt: '2026-11-10T11:30:00+03:00',
+        recordedByUid: 'u1',
+        recordedByEmail: 's@shop.example',
+        recordedByName: 'Staff',
+      },
+    ];
+
+    const pastSummary = summarizeDailyCollections(payments, '2026-11-10', [deletedOrder]);
+    expect(pastSummary.totalCollectedUgx).toBe(80000);
+    expect(pastSummary.items).toHaveLength(2);
+    expect(pastSummary.excludedDeletedItems).toHaveLength(1);
+    expect(pastSummary.excludedDeletedItems[0].deletedOrder.deletedByName).toBe('Admin User');
+
+    const cashFlowEntries = [
+      {
+        entryId: 'CF-1',
+        type: 'other_sale' as const,
+        paymentMethod: 'cash' as const,
+        description: 'Birthday candles',
+        amountUgx: 15000,
+        entryDate: '2026-11-10',
+        entryTime: '12:00',
+        createdAt: '2026-11-10T12:00:00+03:00',
+        recordedByUid: 'u1',
+        recordedByEmail: 's@shop.example',
+        recordedByName: 'Staff',
+      },
+      {
+        entryId: 'CF-2',
+        type: 'expense' as const,
+        paymentMethod: 'cash' as const,
+        description: 'Cooking gas',
+        amountUgx: 90000,
+        entryDate: '2026-11-10',
+        entryTime: '13:00',
+        createdAt: '2026-11-10T13:00:00+03:00',
+        recordedByUid: 'u1',
+        recordedByEmail: 's@shop.example',
+        recordedByName: 'Staff',
+      },
+      {
+        entryId: 'CF-3',
+        type: 'expense' as const,
+        paymentMethod: 'mobile_money' as const,
+        description: 'Delivery boda',
+        amountUgx: 10000,
+        entryDate: '2026-11-10',
+        entryTime: '13:30',
+        createdAt: '2026-11-10T13:30:00+03:00',
+        recordedByUid: 'u1',
+        recordedByEmail: 's@shop.example',
+        recordedByName: 'Staff',
+      },
+    ];
+
+    const cfSummary = summarizeDailyCashFlow(payments, cashFlowEntries, '2026-11-10', [deletedOrder]);
+    // Cash: 15,000 in - 90,000 out = -75,000
+    expect(cfSummary.cash).toEqual({
+      moneyInUgx: 15000,
+      moneyOutUgx: 90000,
+      netMovementUgx: -75000,
+    });
+    // Mobile Money: 60,000 in - 10,000 out = +50,000
+    expect(cfSummary.mobileMoney).toEqual({
+      moneyInUgx: 60000,
+      moneyOutUgx: 10000,
+      netMovementUgx: 50000,
+    });
+    // Older record without paymentMethod stays in unspecified, not guessed
+    expect(cfSummary.unspecified).toEqual({
+      moneyInUgx: 20000,
+      moneyOutUgx: 0,
+      netMovementUgx: 20000,
+    });
+    // Combined: 95,000 in - 100,000 out = -5,000
+    expect(cfSummary.totalMoneyInUgx).toBe(95000);
+    expect(cfSummary.expensesOutUgx).toBe(100000);
+    expect(cfSummary.netMovementUgx).toBe(-5000);
+
+    const badCf = validateCashFlowEntry({
+      type: 'expense',
+      paymentMethod: 'cash',
+      description: '',
+      amountUgx: 0,
+      entryDate: '2026-11-10',
+      entryTime: '13:00',
+    });
+    expect(badCf.description).toBeDefined();
+    expect(badCf.amountUgx).toBeDefined();
   });
 });

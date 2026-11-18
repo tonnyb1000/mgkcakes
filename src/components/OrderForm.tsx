@@ -5,6 +5,7 @@ import type {
   CakeOrderInput,
   CakeTierDetail,
   IcingType,
+  PaymentMethod,
   PaymentTransaction,
 } from '../types/order';
 import {
@@ -85,7 +86,8 @@ interface OrderFormProps {
   onRecordPayment?: (
     orderId: string,
     amountUgx: number,
-    idempotencyPaymentId: string
+    idempotencyPaymentId: string,
+    paymentMethod: PaymentMethod
   ) => Promise<void>;
   onCancel?: () => void;
 }
@@ -132,6 +134,7 @@ function buildInitialState(existing?: CakeOrder | null): CakeOrderInput {
       tierDetails: initialTiers,
       totalPriceUgx: totalFromTiers,
       amountPaidUgx: 0,
+      depositPaymentMethod: 'cash',
       pickupStatus: 'waiting',
     };
   }
@@ -188,6 +191,7 @@ export const OrderForm: React.FC<OrderFormProps> = ({
   const saveAttemptedRef = useRef<boolean>(Boolean(initialDraft?.saveAttempted));
   const expectedUpdatedAtRef = useRef<string | undefined>(existingOrder?.updatedAt);
   const [additionalPaymentInput, setAdditionalPaymentInput] = useState('');
+  const [additionalPaymentMethod, setAdditionalPaymentMethod] = useState<PaymentMethod>('cash');
   const [errors, setErrors] = useState<OrderValidationErrors>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [reconcileConflict, setReconcileConflict] = useState<{
@@ -349,7 +353,12 @@ export const OrderForm: React.FC<OrderFormProps> = ({
       if (!pendingPaymentIdRef.current) {
         pendingPaymentIdRef.current = generatePaymentId(getKampalaToday());
       }
-      await onRecordPayment(existingOrder.orderId, cleanExtra, pendingPaymentIdRef.current);
+      await onRecordPayment(
+        existingOrder.orderId,
+        cleanExtra,
+        pendingPaymentIdRef.current,
+        additionalPaymentMethod
+      );
       pendingPaymentIdRef.current = null;
       setForm((prev) => ({
         ...prev,
@@ -863,6 +872,22 @@ export const OrderForm: React.FC<OrderFormProps> = ({
             </div>
           </div>
 
+          {!isEditing && (
+            <div className="field">
+              <label htmlFor="deposit-method">Deposit Payment Method</label>
+              <select
+                id="deposit-method"
+                value={form.depositPaymentMethod ?? 'cash'}
+                onChange={(e) =>
+                  updateField('depositPaymentMethod', e.target.value as PaymentMethod)
+                }
+              >
+                <option value="cash">Cash</option>
+                <option value="mobile_money">Mobile Money</option>
+              </select>
+            </div>
+          )}
+
           {isEditing && (
             <div className="add-payment-row stack-md">
               {paymentMessage && (
@@ -879,9 +904,9 @@ export const OrderForm: React.FC<OrderFormProps> = ({
                 </div>
               )}
 
-              <div className="field">
-                <label htmlFor="add-payment">Record Balance Payment (UGX)</label>
-                <div className="inline-input-group">
+              <div className="grid-2">
+                <div className="field">
+                  <label htmlFor="add-payment">Record Balance Payment (UGX)</label>
                   <input
                     id="add-payment"
                     type="number"
@@ -895,14 +920,32 @@ export const OrderForm: React.FC<OrderFormProps> = ({
                     placeholder="e.g. 50000"
                     disabled={recordingPayment || liveBalance === 0}
                   />
-                  <button
-                    type="button"
-                    className="btn btn-secondary"
-                    onClick={handleApplyAdditionalPayment}
-                    disabled={recordingPayment || liveBalance === 0}
-                  >
-                    {recordingPayment ? 'Recording…' : 'Record Payment'}
-                  </button>
+                </div>
+
+                <div className="field">
+                  <label htmlFor="balance-payment-method">Payment Method</label>
+                  <div className="inline-input-group">
+                    <select
+                      id="balance-payment-method"
+                      value={additionalPaymentMethod}
+                      onChange={(e) => {
+                        setAdditionalPaymentMethod(e.target.value as PaymentMethod);
+                        pendingPaymentIdRef.current = null;
+                      }}
+                      disabled={recordingPayment || liveBalance === 0}
+                    >
+                      <option value="cash">Cash</option>
+                      <option value="mobile_money">Mobile Money</option>
+                    </select>
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      onClick={handleApplyAdditionalPayment}
+                      disabled={recordingPayment || liveBalance === 0}
+                    >
+                      {recordingPayment ? 'Recording…' : 'Record Payment'}
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -914,8 +957,13 @@ export const OrderForm: React.FC<OrderFormProps> = ({
                       <li key={p.paymentId}>
                         <span>
                           {formatDateDisplay(p.receivedDate)} {p.receivedTime} &middot;{' '}
-                          {p.kind === 'order_deposit' ? 'Deposit' : 'Balance Payment'} (
-                          {p.recordedByName || p.recordedByEmail})
+                          {p.kind === 'order_deposit' ? 'Deposit' : 'Balance Payment'} &middot;{' '}
+                          {p.paymentMethod === 'cash'
+                            ? 'Cash'
+                            : p.paymentMethod === 'mobile_money'
+                            ? 'Mobile Money'
+                            : 'Method not recorded'}{' '}
+                          ({p.recordedByName || p.recordedByEmail})
                         </span>
                         <strong>{formatUgx(p.amountUgx)}</strong>
                       </li>
