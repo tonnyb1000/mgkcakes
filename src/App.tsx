@@ -6,6 +6,7 @@ import { HeaderBar, type ActiveTab } from './components/HeaderBar';
 import { clearPendingNewOrderDraft } from './components/OrderForm';
 import { OrderForm } from './components/OrderForm';
 import { OrdersPage } from './components/OrdersPage';
+import { ReceiptView } from './components/ReceiptView';
 import { SalesCollectionsPage } from './components/SalesCollectionsPage';
 import { createOrderRepository, type OrderRepository } from './services/orderRepository';
 import type {
@@ -24,6 +25,35 @@ interface AppProps {
   repository?: OrderRepository;
 }
 
+export const PENDING_RECEIPT_STORAGE_KEY = 'cake_order_pending_receipt_v1';
+
+interface ReceiptState {
+  orderId: string;
+  required: boolean;
+}
+
+function loadPendingReceipt(): ReceiptState | null {
+  if (typeof window === 'undefined' || !window.sessionStorage) return null;
+  const id = window.sessionStorage.getItem(PENDING_RECEIPT_STORAGE_KEY);
+  return id ? { orderId: id, required: true } : null;
+}
+
+function savePendingReceipt(orderId: string): void {
+  try {
+    window.sessionStorage.setItem(PENDING_RECEIPT_STORAGE_KEY, orderId);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function clearPendingReceipt(): void {
+  try {
+    window.sessionStorage.removeItem(PENDING_RECEIPT_STORAGE_KEY);
+  } catch {
+    // ignore storage errors
+  }
+}
+
 export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
   const repo = useMemo(() => injectedRepo ?? createOrderRepository(), [injectedRepo]);
 
@@ -35,6 +65,8 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
   const [editingOrder, setEditingOrder] = useState<CakeOrder | null>(null);
   const [editingDirty, setEditingDirty] = useState(false);
   const [pendingNavAction, setPendingNavAction] = useState<(() => void) | null>(null);
+  const [receipt, setReceipt] = useState<ReceiptState | null>(() => loadPendingReceipt());
+  const [dataLoadedOnce, setDataLoadedOnce] = useState(false);
 
   const [orders, setOrders] = useState<CakeOrder[]>([]);
   const [payments, setPayments] = useState<PaymentTransaction[]>([]);
@@ -70,6 +102,7 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
       setOrders(orderList);
       setPayments(paymentList);
       setCashFlowEntries(cashFlowList);
+      setDataLoadedOnce(true);
     } catch (err) {
       setDataError(err instanceof Error ? err.message : 'Failed to load data.');
     } finally {
@@ -80,6 +113,26 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
   useEffect(() => {
     void loadData();
   }, [loadData]);
+
+  // Drop a stale pending receipt if its order no longer exists after data has loaded.
+  useEffect(() => {
+    if (!receipt || !dataLoadedOnce || dataLoading) return;
+    if (!orders.some((o) => o.orderId === receipt.orderId)) {
+      clearPendingReceipt();
+      setReceipt(null);
+    }
+  }, [receipt, dataLoadedOnce, dataLoading, orders]);
+
+  const requireReceipt = (orderId: string) => {
+    savePendingReceipt(orderId);
+    setReceipt({ orderId, required: true });
+  };
+
+  const finishReceipt = () => {
+    clearPendingReceipt();
+    setReceipt(null);
+    setActiveTab('orders');
+  };
 
   const handleSignIn = async (email: string, password: string) => {
     setAuthError(null);
@@ -139,6 +192,7 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
       }
       setActiveTab('orders');
       setBannerMessage(`Order ${created.orderId} saved for ${created.customerName}.`);
+      requireReceipt(created.orderId);
     }
   };
 
@@ -206,6 +260,12 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
   };
 
   const handleTabChange = (tab: ActiveTab) => {
+    if (receipt?.required) {
+      setBannerMessage(
+        `Print the receipt for order ${receipt.orderId} before leaving this screen.`
+      );
+      return;
+    }
     if (editingOrder && editingDirty) {
       setPendingNavAction(() => () => {
         setEditingOrder(null);
@@ -227,6 +287,20 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
         ? payments.filter((p) => p.orderId === editingOrder.orderId)
         : [],
     [editingOrder, payments]
+  );
+
+  const receiptOrder = useMemo(
+    () => (receipt ? orders.find((o) => o.orderId === receipt.orderId) ?? null : null),
+    [receipt, orders]
+  );
+  const receiptPayments = useMemo(
+    () =>
+      receiptOrder
+        ? payments
+            .filter((p) => p.orderId === receiptOrder.orderId)
+            .sort((a, b) => a.receivedAt.localeCompare(b.receivedAt))
+        : [],
+    [receiptOrder, payments]
   );
 
   return (
@@ -265,7 +339,15 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
             </div>
           )}
 
-          {editingOrder ? (
+          {receiptOrder && receipt ? (
+            <ReceiptView
+              key={receiptOrder.orderId}
+              order={receiptOrder}
+              orderPayments={receiptPayments}
+              required={receipt.required}
+              onDone={finishReceipt}
+            />
+          ) : editingOrder ? (
             <OrderForm
               key={editingOrder.orderId}
               existingOrder={editingOrder}
@@ -288,6 +370,7 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
             <OrderForm
               onSave={handleSaveOrder}
               onCheckExistingOrder={(orderId) => repo.getOrderById(orderId, user)}
+              onReceiptRequired={requireReceipt}
               onResolveKeepSaved={async (savedOrder) => {
                 setOrders((prev) =>
                   prev.some((o) => o.orderId === savedOrder.orderId)
@@ -300,6 +383,7 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
                 }
                 setActiveTab('orders');
                 setBannerMessage(`Reconciled existing order ${savedOrder.orderId}.`);
+                requireReceipt(savedOrder.orderId);
               }}
               onCancel={() => handleTabChange('orders')}
             />
@@ -334,6 +418,7 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
                 setEditingOrder(order);
               }}
               onTogglePickupStatus={handleTogglePickupStatus}
+              onPrintReceipt={(order) => setReceipt({ orderId: order.orderId, required: false })}
               onDeleteOrder={handleDeleteOrder}
               onCreateNew={() => handleTabChange('new')}
             />

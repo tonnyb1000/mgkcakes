@@ -23,6 +23,7 @@ interface OrdersPageProps {
   onEditOrder: (order: CakeOrder) => void;
   onTogglePickupStatus: (order: CakeOrder, nextStatus: PickupStatus) => Promise<void>;
   onDeleteOrder?: (order: CakeOrder) => Promise<void>;
+  onPrintReceipt?: (order: CakeOrder) => void;
   onCreateNew: () => void;
 }
 
@@ -53,6 +54,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
   onEditOrder,
   onTogglePickupStatus,
   onDeleteOrder,
+  onPrintReceipt,
   onCreateNew,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
@@ -427,6 +429,15 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                     >
                       {isPickedUp ? 'Mark Waiting Again' : 'Mark Picked Up'}
                     </button>
+                    {onPrintReceipt && (
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => onPrintReceipt(order)}
+                      >
+                        Print Receipt
+                      </button>
+                    )}
                     {isAdmin && onDeleteOrder && (
                       <button
                         type="button"

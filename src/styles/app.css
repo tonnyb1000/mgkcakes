@@ -1364,3 +1364,104 @@ code {
     text-align: left;
   }
 }
+
+/* ===== Receipt ===== */
+.receipt-sheet {
+  background: #ffffff;
+  color: #111111;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  max-width: 400px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 1rem 1.1rem;
+  font-size: 0.9rem;
+}
+
+.receipt-shop {
+  margin: 0;
+  font-size: 1.3rem;
+  text-align: center;
+}
+
+.receipt-sub {
+  text-align: center;
+  font-size: 0.8rem;
+  margin-bottom: 0.4rem;
+}
+
+.receipt-oid {
+  text-align: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 700;
+  margin: 0.4rem 0;
+}
+
+.receipt-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.35rem 0;
+}
+
+.receipt-table th {
+  text-align: left;
+  width: 34%;
+  vertical-align: top;
+  padding: 0.15rem 0.4rem 0.15rem 0;
+  font-weight: 600;
+}
+
+.receipt-table td {
+  padding: 0.15rem 0;
+  vertical-align: top;
+}
+
+.receipt-num {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.receipt-balance th,
+.receipt-balance td {
+  border-top: 1px solid #111111;
+  font-weight: 700;
+}
+
+.receipt-rule {
+  border: none;
+  border-top: 1px dashed #555555;
+  margin: 0.6rem 0;
+}
+
+.receipt-note {
+  font-size: 0.75rem;
+  text-align: center;
+}
+
+@media print {
+  body {
+    background: #ffffff !important;
+    background-image: none !important;
+  }
+
+  body * {
+    visibility: hidden;
+  }
+
+  .receipt-sheet,
+  .receipt-sheet * {
+    visibility: visible;
+  }
+
+  .receipt-sheet {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    max-width: none;
+    border: none;
+    box-shadow: none;
+    border-radius: 0;
+  }
+}

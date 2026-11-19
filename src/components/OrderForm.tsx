@@ -81,6 +81,7 @@ interface OrderFormProps {
   ) => Promise<void>;
   onCheckExistingOrder?: (orderId: string) => Promise<CakeOrder | null>;
   onResolveKeepSaved?: (existingOrder: CakeOrder) => void;
+  onReceiptRequired?: (orderId: string) => void;
   onReloadExistingOrder?: (latestOrder: CakeOrder) => void;
   onDirtyChange?: (dirty: boolean) => void;
   onRecordPayment?: (
@@ -167,6 +168,7 @@ export const OrderForm: React.FC<OrderFormProps> = ({
   onSave,
   onCheckExistingOrder,
   onResolveKeepSaved,
+  onReceiptRequired,
   onReloadExistingOrder,
   onDirtyChange,
   onRecordPayment,
@@ -483,6 +485,9 @@ export const OrderForm: React.FC<OrderFormProps> = ({
       clearPendingNewOrderDraft();
       setReconcileConflict(null);
       onDirtyChange?.(false);
+      if (!isEditing) {
+        onReceiptRequired?.(reconcileConflict.existingOrder.orderId);
+      }
     } catch (err) {
       if (err instanceof OrderReconcileConflictError) {
         setReconcileConflict({

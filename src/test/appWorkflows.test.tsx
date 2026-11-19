@@ -32,6 +32,7 @@ import {
   getKampalaToday,
 } from '../utils/dateKampala';
 import { generateOrderId } from '../utils/orderId';
+import { buildReceiptHtml } from '../utils/receipt';
 
 /**
  * Test-only in-memory repository for UI workflow verification.
@@ -468,6 +469,12 @@ function makeTestOrders(): CakeOrder[] {
   ];
 }
 
+async function completeReceipt(user: ReturnType<typeof userEvent.setup>) {
+  expect(await screen.findByRole('heading', { name: /Print Receipt \(Required\)/i })).toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: /^Print Receipt$/i }));
+  await user.click(screen.getByRole('button', { name: /^Continue$/i }));
+}
+
 async function signInAs(user: ReturnType<typeof userEvent.setup>, email: string) {
   await user.type(screen.getByLabelText(/Staff Email/i), email);
   await user.type(screen.getByLabelText(/Password/i), 'test-password-123');
@@ -560,6 +567,7 @@ describe('Cake Order Tracker workflows & access control', () => {
     expect(screen.getAllByText(/UGX 100,000/).length).toBeGreaterThanOrEqual(1);
 
     await user.click(screen.getByRole('button', { name: /Save Order/i }));
+    await completeReceipt(user);
     const graceHeading = await screen.findByText('Grace Atwine');
     const graceCard = graceHeading.closest('article')!;
     expect(within(graceCard).getByText(/Balance: UGX 100,000/i)).toBeInTheDocument();
@@ -652,6 +660,7 @@ describe('Cake Order Tracker workflows & access control', () => {
     await user.clear(paidInput);
     await user.type(paidInput, '50000');
     await user.click(screen.getByRole('button', { name: /Save Order/i }));
+    await completeReceipt(user);
 
     // 2. Mark Daniel Okello (fully paid historical order) as Picked up -> must NOT add to today's collections
     const danielCard = (await screen.findByText('Daniel Okello')).closest('article')!;
@@ -772,6 +781,7 @@ describe('Cake Order Tracker workflows & access control', () => {
     // Draft is restored; retry Save Order
     expect(screen.getByLabelText(/Customer Name/i)).toHaveValue('Retry Safe Customer');
     await user.click(screen.getByRole('button', { name: /Save Order/i }));
+    await completeReceipt(user);
     await screen.findByText('Retry Safe Customer');
 
     // Verify no duplicate order or duplicate deposit payment was created
@@ -857,6 +867,7 @@ describe('Cake Order Tracker workflows & access control', () => {
 
     // Apply edits to the saved order without creating a duplicate
     await user.click(screen.getByRole('button', { name: /Update Saved Order with My Edits/i }));
+    await completeReceipt(user);
     expect(await screen.findByText('Updated vanilla berry cake')).toBeInTheDocument();
 
     const staffUser: StaffUser = {
@@ -922,6 +933,7 @@ describe('Cake Order Tracker workflows & access control', () => {
     await user.type(descInput, 'Reconciled vanilla');
     await user.click(screen.getByRole('button', { name: /Save Order/i }));
     await user.click(await screen.findByRole('button', { name: /Update Saved Order with My Edits/i }));
+    await completeReceipt(user);
     await screen.findByText('Reconciled vanilla');
 
     // Daily Collections must include the UGX 40,000 deposit from the reconciled order
@@ -1062,6 +1074,7 @@ describe('Cake Order Tracker workflows & access control', () => {
     await user.clear(paidInput);
     await user.type(paidInput, '60000');
     await user.click(screen.getByRole('button', { name: /Save Order/i }));
+    await completeReceipt(user);
 
     const delCard = (await screen.findByText('Deleted Order Test')).closest('article')!;
     await user.click(within(delCard).getByRole('button', { name: /Delete Order/i }));
@@ -1083,5 +1096,97 @@ describe('Cake Order Tracker workflows & access control', () => {
       screen.getByText(/Retained Payment History for Deleted Orders \(Excluded from Totals\)/i)
     ).toBeInTheDocument();
     expect(screen.getByText(/Order deleted by/i)).toBeInTheDocument();
+  });
+});
+
+
+describe('Mandatory order receipt', () => {
+  async function createOrderViaForm(user: ReturnType<typeof userEvent.setup>, name: string) {
+    await user.click(await screen.findByRole('button', { name: /New Order/i }));
+    await user.type(screen.getByLabelText(/Customer Name/i), name);
+    await user.type(screen.getByLabelText(/Phone Number/i), '0772123123');
+    await user.type(screen.getByLabelText(/Cake Description/i), 'Receipt test cake <b>bold</b>');
+    const tier1Quick = screen.getByRole('group', { name: /Quick prices for Tier 1/i });
+    await user.click(within(tier1Quick).getByRole('button', { name: '100,000' }));
+    const paidInput = screen.getByLabelText(/Deposit Paid \(UGX\)/i);
+    await user.clear(paidInput);
+    await user.type(paidInput, '40000');
+    await user.click(screen.getByRole('button', { name: /Save Order/i }));
+  }
+
+  it('requires printing the receipt after an order is saved, blocks navigation, and allows download', async () => {
+    const user = userEvent.setup();
+    const repo = new TestMemoryOrderRepository(makeTestOrders());
+    render(<App repository={repo} />);
+    await signInAs(user, 'staff@shop.example');
+    await createOrderViaForm(user, 'Receipt Customer');
+
+    // Required receipt screen appears with order details
+    expect(
+      await screen.findByRole('heading', { name: /Print Receipt \(Required\)/i })
+    ).toBeInTheDocument();
+    const sheet = screen.getByLabelText(/Receipt preview/i);
+    expect(within(sheet).getByText('Receipt Customer')).toBeInTheDocument();
+    expect(within(sheet).getByText('UGX 60,000')).toBeInTheDocument(); // balance
+    expect(within(sheet).getByText(/^ORD-/)).toBeInTheDocument();
+
+    // Continue is locked until printed; downloading alone does not unlock it
+    const continueBtn = screen.getByRole('button', { name: /^Continue$/i });
+    expect(continueBtn).toBeDisabled();
+
+    const createObjUrl = vi.fn(() => 'blob:receipt');
+    globalThis.URL.createObjectURL = createObjUrl;
+    globalThis.URL.revokeObjectURL = vi.fn();
+    await user.click(screen.getByRole('button', { name: /Download Receipt/i }));
+    expect(createObjUrl).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: /^Continue$/i })).toBeDisabled();
+
+    // Navigation is blocked while the receipt is pending
+    await user.click(screen.getByRole('button', { name: /View Orders/i }));
+    expect(
+      screen.getByRole('heading', { name: /Print Receipt \(Required\)/i })
+    ).toBeInTheDocument();
+    expect(screen.getByText(/before leaving this screen/i)).toBeInTheDocument();
+
+    // Printing unlocks Continue
+    await user.click(screen.getByRole('button', { name: /^Print Receipt$/i }));
+    expect(window.print).toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: /^Continue$/i })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: /^Continue$/i }));
+    expect(await screen.findByText('Receipt Customer')).toBeInTheDocument();
+  });
+
+  it('keeps the receipt required after a page refresh and allows optional reprint from the order card', async () => {
+    const user = userEvent.setup();
+    const repo = new TestMemoryOrderRepository(makeTestOrders());
+    const { unmount } = render(<App repository={repo} />);
+    await signInAs(user, 'staff@shop.example');
+    await createOrderViaForm(user, 'Refresh Customer');
+    await screen.findByRole('heading', { name: /Print Receipt \(Required\)/i });
+
+    // Simulate refresh: remount; receipt is still required
+    unmount();
+    render(<App repository={repo} />);
+    expect(
+      await screen.findByRole('heading', { name: /Print Receipt \(Required\)/i })
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /^Print Receipt$/i }));
+    await user.click(screen.getByRole('button', { name: /^Continue$/i }));
+
+    // Reprint from order card is optional (Close is enabled without printing)
+    const card = (await screen.findByText('Refresh Customer')).closest('article')!;
+    await user.click(within(card).getByRole('button', { name: /Print Receipt/i }));
+    expect(screen.getByRole('heading', { name: /^Order Receipt$/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Close$/i })).toBeEnabled();
+  });
+
+  it('escapes customer text in the downloadable receipt HTML', () => {
+    const order = { ...makeTestOrders()[0], description: '<script>alert(1)</script>', customerName: 'A & B' };
+    const html = buildReceiptHtml(order, []);
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(html).toContain('A &amp; B');
+    expect(html).toContain(order.orderId);
+    expect(html).toContain('Balance due');
   });
 });
