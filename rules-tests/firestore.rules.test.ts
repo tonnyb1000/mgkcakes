@@ -569,4 +569,68 @@ describe('Firestore security rules & emulator consistency', () => {
     await assertFails(deleteDoc(doc(staffDb, 'cashFlowEntries', 'CF-20261118-EXP001')));
     await assertFails(deleteDoc(doc(ownerDb, 'cashFlowEntries', 'CF-20261118-EXP001')));
   });
+
+  it('allows marking an order picked up with Kampala pickup timestamp and atomic balance payment', async () => {
+    const staffDb = testEnv.authenticatedContext('staff-uid').firestore();
+    const orderId = 'ORD-20261120-PICK1';
+    const depositId = 'PAY-20261120-DEP1';
+    const balancePayId = 'PAY-20261120-BAL1';
+    const orderRef = doc(staffDb, 'orders', orderId);
+
+    await assertSucceeds(
+      runTransaction(staffDb, async (tx) => {
+        tx.set(doc(staffDb, 'payments', depositId), makePayment({
+          paymentId: depositId,
+          kind: 'order_deposit',
+          orderId,
+          amountUgx: 50000,
+        }));
+        tx.set(orderRef, makeOrder({
+          orderId,
+          totalPriceUgx: 150000,
+          amountPaidUgx: 50000,
+          balanceUgx: 100000,
+          lastPaymentId: depositId,
+        }));
+      })
+    );
+
+    // Invalid pickedUpDate format is rejected
+    await assertFails(
+      updateDoc(orderRef, {
+        pickupStatus: 'picked_up',
+        pickedUpDate: '20-11-2026',
+        pickedUpTime: '14:30',
+        pickedUpAt: '2026-11-20T14:30:00+03:00',
+      })
+    );
+
+    // Atomic pickup with balance payment succeeds
+    await assertSucceeds(
+      runTransaction(staffDb, async (tx) => {
+        tx.set(doc(staffDb, 'payments', balancePayId), makePayment({
+          paymentId: balancePayId,
+          kind: 'order_balance',
+          paymentMethod: 'mobile_money',
+          orderId,
+          amountUgx: 100000,
+          receivedDate: '2026-11-20',
+          receivedTime: '14:30',
+          receivedAt: '2026-11-20T14:30:00+03:00',
+        }));
+        tx.update(orderRef, {
+          pickupStatus: 'picked_up',
+          pickedUpDate: '2026-11-20',
+          pickedUpTime: '14:30',
+          pickedUpAt: '2026-11-20T14:30:00+03:00',
+          amountPaidUgx: 150000,
+          balanceUgx: 0,
+          lastPaymentId: balancePayId,
+          updatedAt: '2026-11-20T14:30:00+03:00',
+          updatedByUid: 'staff-uid',
+          updatedByEmail: 'staff@shop.example',
+        });
+      })
+    );
+  });
 });

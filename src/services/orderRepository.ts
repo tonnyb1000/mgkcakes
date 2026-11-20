@@ -76,8 +76,9 @@ export interface OrderRepository {
   updatePickupStatus(
     orderId: string,
     status: PickupStatus,
-    currentUser: StaffUser | null
-  ): Promise<CakeOrder>;
+    currentUser: StaffUser | null,
+    options?: { paymentMethod?: PaymentMethod; idempotencyPaymentId?: string }
+  ): Promise<{ order: CakeOrder; payment?: PaymentTransaction }>;
   deleteOrder(orderId: string, currentUser: StaffUser | null): Promise<CakeOrder>;
   recordOrderPayment(
     orderId: string,
@@ -162,7 +163,7 @@ export class UnconfiguredOrderRepository implements OrderRepository {
     throw new Error('Firebase is not configured. Access is blocked.');
   }
 
-  async updatePickupStatus(): Promise<CakeOrder> {
+  async updatePickupStatus(): Promise<{ order: CakeOrder; payment?: PaymentTransaction }> {
     throw new Error('Firebase is not configured. Access is blocked.');
   }
 
@@ -466,11 +467,16 @@ export class FirestoreOrderRepository implements OrderRepository {
   async updatePickupStatus(
     orderId: string,
     status: PickupStatus,
-    currentUser: StaffUser | null
-  ): Promise<CakeOrder> {
+    currentUser: StaffUser | null,
+    options?: { paymentMethod?: PaymentMethod; idempotencyPaymentId?: string }
+  ): Promise<{ order: CakeOrder; payment?: PaymentTransaction }> {
     assertAuthorizedStaff(currentUser);
     const { db } = this.getServices();
     const ref = doc(db, 'orders', orderId);
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const pickedUpDate = getKampalaToday(now);
+    const pickedUpTime = getKampalaTimeNow(now);
 
     return runTransaction(db, async (tx) => {
       const existingSnap = await tx.get(ref);
@@ -478,22 +484,127 @@ export class FirestoreOrderRepository implements OrderRepository {
         throw new Error(`Order ${orderId} was not found.`);
       }
       const existing = existingSnap.data() as CakeOrder;
-      const updatedAt = new Date().toISOString();
+      if (existing.deletedAt) {
+        throw new Error('Cannot update pickup status of a deleted order.');
+      }
+
+      if (status === 'picked_up') {
+        const outstandingBalance = Math.max(
+          0,
+          calculateBalanceUgx(existing.totalPriceUgx, existing.amountPaidUgx)
+        );
+        const shouldCheckPayment =
+          Boolean(options?.idempotencyPaymentId) ||
+          (existing.pickupStatus !== 'picked_up' && outstandingBalance > 0);
+        const paymentId = shouldCheckPayment
+          ? options?.idempotencyPaymentId || generatePaymentId(pickedUpDate)
+          : '';
+        const paymentRef = paymentId ? doc(db, 'payments', paymentId) : null;
+
+        if (paymentRef) {
+          const existingPaySnap = await tx.get(paymentRef);
+          if (existingPaySnap.exists()) {
+            const existingPay = existingPaySnap.data() as PaymentTransaction;
+            if (existingPay.orderId === orderId) {
+              return { order: existing, payment: existingPay };
+            }
+            throw new Error('This payment ID is already in use for a different payment.');
+          }
+        }
+
+        if (existing.pickupStatus === 'picked_up') {
+          return { order: existing };
+        }
+
+        if (outstandingBalance > 0 && paymentRef) {
+          const paymentMethod = options?.paymentMethod ?? 'cash';
+          const payment: PaymentTransaction = {
+            paymentId,
+            kind: 'order_balance',
+            paymentMethod,
+            orderId,
+            customerName: existing.customerName,
+            description: existing.description,
+            amountUgx: outstandingBalance,
+            receivedDate: pickedUpDate,
+            receivedTime: pickedUpTime,
+            receivedAt: nowIso,
+            recordedByUid: currentUser.uid,
+            recordedByEmail: currentUser.email,
+            recordedByName: currentUser.displayName,
+          };
+
+          const updatedOrder: CakeOrder = {
+            ...existing,
+            pickupStatus: 'picked_up',
+            pickedUpAt: nowIso,
+            pickedUpDate,
+            pickedUpTime,
+            amountPaidUgx: existing.totalPriceUgx,
+            balanceUgx: 0,
+            lastPaymentId: paymentId,
+            updatedAt: nowIso,
+            updatedByUid: currentUser.uid,
+            updatedByEmail: currentUser.email,
+          };
+
+          tx.set(paymentRef, payment);
+          tx.update(ref, {
+            pickupStatus: 'picked_up',
+            pickedUpAt: nowIso,
+            pickedUpDate,
+            pickedUpTime,
+            amountPaidUgx: existing.totalPriceUgx,
+            balanceUgx: 0,
+            lastPaymentId: paymentId,
+            updatedAt: nowIso,
+            updatedByUid: currentUser.uid,
+            updatedByEmail: currentUser.email,
+          });
+
+          return { order: updatedOrder, payment };
+        }
+
+        const updatedOrder: CakeOrder = {
+          ...existing,
+          pickupStatus: 'picked_up',
+          pickedUpAt: nowIso,
+          pickedUpDate,
+          pickedUpTime,
+          updatedAt: nowIso,
+          updatedByUid: currentUser.uid,
+          updatedByEmail: currentUser.email,
+        };
+
+        tx.update(ref, {
+          pickupStatus: 'picked_up',
+          pickedUpAt: nowIso,
+          pickedUpDate,
+          pickedUpTime,
+          updatedAt: nowIso,
+          updatedByUid: currentUser.uid,
+          updatedByEmail: currentUser.email,
+        });
+
+        return { order: updatedOrder };
+      }
+
+      const updatedOrder: CakeOrder = {
+        ...existing,
+        pickupStatus: 'waiting',
+        updatedAt: nowIso,
+        updatedByUid: currentUser.uid,
+        updatedByEmail: currentUser.email,
+      };
 
       tx.update(ref, {
-        pickupStatus: status,
-        updatedAt,
+        pickupStatus: 'waiting',
+        updatedAt: nowIso,
         updatedByUid: currentUser.uid,
         updatedByEmail: currentUser.email,
       });
 
-      return {
-        ...existing,
-        pickupStatus: status,
-        updatedAt,
-        updatedByUid: currentUser.uid,
-        updatedByEmail: currentUser.email,
-      };
+      return { order: updatedOrder };
     });
   }
 

@@ -93,6 +93,9 @@ export interface CakeOrder {
   balanceUgx: number;
   lastPaymentId?: string;
   pickupStatus: PickupStatus;
+  pickedUpAt?: string; // ISO 8601 timestamp when marked picked_up
+  pickedUpDate?: string; // YYYY-MM-DD in Africa/Kampala
+  pickedUpTime?: string; // HH:mm in Africa/Kampala
   createdAt: string; // ISO 8601 timestamp
   updatedAt: string; // ISO 8601 timestamp
   createdByUid: string;

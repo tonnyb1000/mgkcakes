@@ -1,7 +1,7 @@
 import React from 'react';
 import type { StaffUser } from '../types/order';
 
-export type ActiveTab = 'home' | 'orders' | 'new' | 'collections' | 'archive';
+export type ActiveTab = 'home' | 'orders' | 'new' | 'walkin' | 'collections' | 'archive';
 
 interface HeaderBarProps {
   configured: boolean;
@@ -66,6 +66,13 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
             onClick={() => onTabChange('new')}
           >
             New Order
+          </button>
+          <button
+            type="button"
+            className={`nav-tab ${activeTab === 'walkin' ? 'active' : ''}`}
+            onClick={() => onTabChange('walkin')}
+          >
+            Walk-in Sales
           </button>
           <button
             type="button"

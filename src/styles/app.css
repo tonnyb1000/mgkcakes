@@ -1439,6 +1439,85 @@ code {
   text-align: center;
 }
 
+.orders-group-heading {
+  margin: 0;
+  font-size: 1.02rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.modal-field {
+  margin-bottom: 1rem;
+}
+
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  margin-top: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.spreadsheet-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+  min-width: 640px;
+}
+
+.spreadsheet-table th,
+.spreadsheet-table td {
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  border-right: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.spreadsheet-table th:last-child,
+.spreadsheet-table td:last-child {
+  border-right: none;
+}
+
+.spreadsheet-table thead th {
+  background: var(--surface-muted);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-muted);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.spreadsheet-table tbody tr:nth-child(even) {
+  background: rgba(255, 250, 247, 0.7);
+}
+
+.spreadsheet-table tbody tr:hover {
+  background: #fff5f8;
+}
+
+.spreadsheet-table tfoot th,
+.spreadsheet-table tfoot td {
+  background: var(--surface-muted);
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+}
+
+.spreadsheet-table tfoot tr.table-grand-total th,
+.spreadsheet-table tfoot tr.table-grand-total td {
+  background: #fff0f5;
+  border-bottom: none;
+  font-weight: 700;
+}
+
+.spreadsheet-table .num-col {
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
 @media print {
   body {
     background: #ffffff !important;

@@ -1,6 +1,12 @@
 import React, { useMemo, useState } from 'react';
-import type { CakeOrder, PaymentTransaction, PickupStatus, StaffUser } from '../types/order';
-import { getUnrecordedHistoricalAmount } from '../utils/collections';
+import type {
+  CakeOrder,
+  PaymentMethod,
+  PaymentTransaction,
+  PickupStatus,
+  StaffUser,
+} from '../types/order';
+import { generatePaymentId, getUnrecordedHistoricalAmount } from '../utils/collections';
 import { formatUgx } from '../utils/currency';
 import {
   formatDateDisplay,
@@ -21,7 +27,11 @@ interface OrdersPageProps {
   error: string | null;
   onRefresh: () => void;
   onEditOrder: (order: CakeOrder) => void;
-  onTogglePickupStatus: (order: CakeOrder, nextStatus: PickupStatus) => Promise<void>;
+  onTogglePickupStatus: (
+    order: CakeOrder,
+    nextStatus: PickupStatus,
+    options?: { paymentMethod?: PaymentMethod; idempotencyPaymentId?: string }
+  ) => Promise<void>;
   onDeleteOrder?: (order: CakeOrder) => Promise<void>;
   onPrintReceipt?: (order: CakeOrder) => void;
   onCreateNew: () => void;
@@ -64,7 +74,9 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
   const [pendingToggle, setPendingToggle] = useState<{
     order: CakeOrder;
     nextStatus: PickupStatus;
+    idempotencyPaymentId?: string;
   } | null>(null);
+  const [pickupPaymentMethod, setPickupPaymentMethod] = useState<PaymentMethod>('cash');
   const [pendingDelete, setPendingDelete] = useState<CakeOrder | null>(null);
   const [toggling, setToggling] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -110,7 +122,18 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
     if (!pendingToggle) return;
     setToggling(true);
     try {
-      await onTogglePickupStatus(pendingToggle.order, pendingToggle.nextStatus);
+      const hasBalance =
+        pendingToggle.nextStatus === 'picked_up' && pendingToggle.order.balanceUgx > 0;
+      await onTogglePickupStatus(
+        pendingToggle.order,
+        pendingToggle.nextStatus,
+        hasBalance
+          ? {
+              paymentMethod: pickupPaymentMethod,
+              idempotencyPaymentId: pendingToggle.idempotencyPaymentId,
+            }
+          : undefined
+      );
       setPendingToggle(null);
     } finally {
       setToggling(false);
@@ -132,6 +155,229 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
     setSearchQuery('');
     setQuickView('all');
     setSelectedDate('');
+  };
+
+  const waitingOrders = useMemo(
+    () => filteredOrders.filter((o) => !o.deletedAt && o.pickupStatus === 'waiting'),
+    [filteredOrders]
+  );
+
+  const pickedUpOrders = useMemo(
+    () => filteredOrders.filter((o) => !o.deletedAt && o.pickupStatus === 'picked_up'),
+    [filteredOrders]
+  );
+
+  const openPickupModal = (order: CakeOrder, nextStatus: PickupStatus) => {
+    setPickupPaymentMethod('cash');
+    setPendingToggle({
+      order,
+      nextStatus,
+      idempotencyPaymentId:
+        nextStatus === 'picked_up' && order.balanceUgx > 0
+          ? generatePaymentId(todayKampala)
+          : undefined,
+    });
+  };
+
+  const renderOrderCard = (order: CakeOrder) => {
+    const isDeleted = Boolean(order.deletedAt);
+    const isPickedUp = order.pickupStatus === 'picked_up';
+    const nextStatus: PickupStatus = isPickedUp ? 'waiting' : 'picked_up';
+    const unrecordedHistorical =
+      !isDeleted && payments.length > 0 ? getUnrecordedHistoricalAmount(order, payments) : 0;
+
+    return (
+      <article key={order.orderId} className={`card order-card ${isDeleted ? 'order-card-deleted' : ''}`}>
+        <div className="order-status-strip">
+          {isDeleted ? (
+            <span className="status-badge status-deleted">Deleted</span>
+          ) : (
+            <span
+              className={`status-badge ${
+                isPickedUp ? 'status-picked-up' : 'status-waiting'
+              }`}
+            >
+              {isPickedUp ? 'Picked up' : 'Waiting for pickup'}
+            </span>
+          )}
+          {unrecordedHistorical > 0 && (
+            <span className="status-badge status-review">
+              Historical payment needs review
+            </span>
+          )}
+          <span
+            className={`balance-pill ${
+              order.balanceUgx === 0 ? 'balance-pill-paid' : 'balance-pill-due'
+            }`}
+          >
+            {order.balanceUgx === 0
+              ? 'Balance: UGX 0 (Paid)'
+              : `Balance: ${formatUgx(order.balanceUgx)}`}
+          </span>
+        </div>
+
+        {isDeleted && order.deletedAt && (
+          <div className="notice notice-warning" role="status">
+            Deleted by <strong>{order.deletedByName || order.deletedByEmail}</strong> on{' '}
+            {formatTimestampKampala(order.deletedAt)}. Payment records are retained for history and
+            excluded from daily collection totals.
+          </div>
+        )}
+
+        <div className="order-card-top">
+          <div>
+            <span className="order-id-badge">{order.orderId}</span>
+            <h3 className="customer-name">{order.customerName}</h3>
+            <p className="customer-phone">{order.customerPhone}</p>
+            <p className="help-text">Created: {formatTimestampKampala(order.createdAt)}</p>
+            {isPickedUp && (order.pickedUpDate || order.pickedUpAt) && (
+              <p className="help-text">
+                Picked up:{' '}
+                {order.pickedUpDate
+                  ? `${formatDateDisplay(order.pickedUpDate)}${
+                      order.pickedUpTime ? ` at ${order.pickedUpTime}` : ''
+                    }`
+                  : formatTimestampKampala(order.pickedUpAt ?? '')}
+              </p>
+            )}
+          </div>
+
+          <div className="pickup-block">
+            <span className="pickup-label">Pickup</span>
+            <strong className="pickup-date">{formatDateDisplay(order.pickupDate)}</strong>
+            {order.pickupTime && <span className="pickup-time">{order.pickupTime}</span>}
+          </div>
+        </div>
+
+        <p className="order-desc">{order.description}</p>
+
+        <div
+          className="order-cake-visual"
+          aria-label={`Cake tier illustration for ${order.orderId}`}
+        >
+          <div className="order-cake-stack" aria-hidden="true">
+            {(() => {
+              const count = getCardTierCount(order);
+              const savedTiers =
+                order.tierDetails && order.tierDetails.length > 0
+                  ? [...order.tierDetails].sort((a, b) => b.tierNumber - a.tierNumber)
+                  : Array.from({ length: count }, (_, idx) => ({
+                      tierNumber: count - idx,
+                      shape: '',
+                      priceUgx: 0,
+                    }));
+              return savedTiers.map((t) => (
+                <div
+                  key={t.tierNumber}
+                  className="mini-cylinder"
+                  style={{ width: `${getMiniCylinderWidth(t.tierNumber, count)}%` }}
+                >
+                  <div className="mini-cylinder-top" />
+                  <div className="mini-cylinder-body" />
+                </div>
+              ));
+            })()}
+          </div>
+
+          <div className="order-cake-meta">
+            {order.tierDetails && order.tierDetails.length > 0 ? (
+              <ul className="order-tier-list">
+                {[...order.tierDetails]
+                  .sort((a, b) => b.tierNumber - a.tierNumber)
+                  .map((t) => (
+                    <li key={t.tierNumber}>
+                      <span>
+                        Tier {t.tierNumber}
+                        {t.shape ? ` (${t.shape})` : ''}
+                      </span>
+                      <strong>{formatUgx(t.priceUgx)}</strong>
+                    </li>
+                  ))}
+              </ul>
+            ) : (
+              order.tiers && (
+                <div className="order-meta-line">
+                  <span>Tiers:</span> <strong>{order.tiers}</strong>
+                </div>
+              )
+            )}
+
+            {(order.shape || order.size) && (
+              <div className="order-meta-tags">
+                {order.shape && (
+                  <span>
+                    Shape: <strong>{order.shape}</strong>
+                  </span>
+                )}
+                {order.size && (
+                  <span>
+                    Size: <strong>{order.size}</strong>
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="money-grid">
+          <div>
+            <span className="money-label">Total</span>
+            <strong className="money-val">{formatUgx(order.totalPriceUgx)}</strong>
+          </div>
+          <div>
+            <span className="money-label">Paid</span>
+            <strong className="money-val">{formatUgx(order.amountPaidUgx)}</strong>
+          </div>
+          <div>
+            <span className="money-label">Balance</span>
+            <strong
+              className={`money-val ${
+                order.balanceUgx === 0 ? 'balance-zero' : 'balance-due'
+              }`}
+            >
+              {formatUgx(order.balanceUgx)}
+            </strong>
+          </div>
+        </div>
+
+        {!isDeleted && (
+          <div className="order-card-actions">
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              onClick={() => onEditOrder(order)}
+            >
+              View or Edit Order
+            </button>
+            <button
+              type="button"
+              className={`btn btn-sm ${isPickedUp ? 'btn-ghost' : 'btn-primary'}`}
+              onClick={() => openPickupModal(order, nextStatus)}
+            >
+              {isPickedUp ? 'Mark Waiting Again' : 'Mark Picked Up'}
+            </button>
+            {onPrintReceipt && (
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={() => onPrintReceipt(order)}
+              >
+                Print Receipt
+              </button>
+            )}
+            {isAdmin && onDeleteOrder && (
+              <button
+                type="button"
+                className="btn btn-danger btn-sm"
+                onClick={() => setPendingDelete(order)}
+              >
+                Delete Order
+              </button>
+            )}
+          </div>
+        )}
+      </article>
+    );
   };
 
   return (
@@ -260,198 +506,57 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
       )}
 
       {!loading && !error && filteredOrders.length > 0 && (
-        <div className="orders-list" aria-live="polite">
-          {filteredOrders.map((order) => {
-            const isDeleted = Boolean(order.deletedAt);
-            const isPickedUp = order.pickupStatus === 'picked_up';
-            const nextStatus: PickupStatus = isPickedUp ? 'waiting' : 'picked_up';
-            const unrecordedHistorical =
-              !isDeleted && payments.length > 0
-                ? getUnrecordedHistoricalAmount(order, payments)
-                : 0;
-
-            return (
-              <article key={order.orderId} className={`card order-card ${isDeleted ? 'order-card-deleted' : ''}`}>
-                <div className="order-status-strip">
-                  {isDeleted ? (
-                    <span className="status-badge status-deleted">Deleted</span>
-                  ) : (
-                    <span
-                      className={`status-badge ${
-                        isPickedUp ? 'status-picked-up' : 'status-waiting'
-                      }`}
-                    >
-                      {isPickedUp ? 'Picked up' : 'Waiting for pickup'}
-                    </span>
-                  )}
-                  {unrecordedHistorical > 0 && (
-                    <span className="status-badge status-review">
-                      Historical payment needs review
-                    </span>
-                  )}
-                  <span
-                    className={`balance-pill ${
-                      order.balanceUgx === 0 ? 'balance-pill-paid' : 'balance-pill-due'
-                    }`}
-                  >
-                    {order.balanceUgx === 0
-                      ? 'Balance: UGX 0 (Paid)'
-                      : `Balance: ${formatUgx(order.balanceUgx)}`}
-                  </span>
-                </div>
-
-                {isDeleted && order.deletedAt && (
-                  <div className="notice notice-warning" role="status">
-                    Deleted by <strong>{order.deletedByName || order.deletedByEmail}</strong> on{' '}
-                    {formatTimestampKampala(order.deletedAt)}. Payment records are retained for
-                    history and excluded from daily collection totals.
+        <div className="stack-lg" aria-live="polite">
+          {quickView === 'deleted' ? (
+            <section className="stack-md" aria-label="Deleted orders">
+              <h3 className="orders-group-heading">
+                Deleted Orders ({filteredOrders.length})
+              </h3>
+              <div className="orders-list">{filteredOrders.map(renderOrderCard)}</div>
+            </section>
+          ) : quickView === 'waiting' ? (
+            <section className="stack-md" aria-label="Orders waiting for pickup">
+              <h3 className="orders-group-heading">
+                Waiting for Pickup ({waitingOrders.length})
+              </h3>
+              <div className="orders-list">{waitingOrders.map(renderOrderCard)}</div>
+            </section>
+          ) : quickView === 'picked_up' ? (
+            <section className="stack-md" aria-label="Orders already picked up">
+              <h3 className="orders-group-heading">
+                Already Picked Up ({pickedUpOrders.length})
+              </h3>
+              <div className="orders-list">{pickedUpOrders.map(renderOrderCard)}</div>
+            </section>
+          ) : (
+            <>
+              <section className="stack-md" aria-label="Orders waiting for pickup">
+                <h3 className="orders-group-heading">
+                  Waiting for Pickup ({waitingOrders.length})
+                </h3>
+                {waitingOrders.length === 0 ? (
+                  <div className="card state-card">
+                    <p className="muted-text">No orders waiting for pickup in this view.</p>
                   </div>
+                ) : (
+                  <div className="orders-list">{waitingOrders.map(renderOrderCard)}</div>
                 )}
+              </section>
 
-                <div className="order-card-top">
-                  <div>
-                    <span className="order-id-badge">{order.orderId}</span>
-                    <h3 className="customer-name">{order.customerName}</h3>
-                    <p className="customer-phone">{order.customerPhone}</p>
-                    <p className="help-text">
-                      Created: {formatTimestampKampala(order.createdAt)}
-                    </p>
+              <section className="stack-md" aria-label="Orders already picked up">
+                <h3 className="orders-group-heading">
+                  Already Picked Up ({pickedUpOrders.length})
+                </h3>
+                {pickedUpOrders.length === 0 ? (
+                  <div className="card state-card">
+                    <p className="muted-text">No picked-up orders in this view.</p>
                   </div>
-
-                  <div className="pickup-block">
-                    <span className="pickup-label">Pickup</span>
-                    <strong className="pickup-date">{formatDateDisplay(order.pickupDate)}</strong>
-                    {order.pickupTime && <span className="pickup-time">{order.pickupTime}</span>}
-                  </div>
-                </div>
-
-                <p className="order-desc">{order.description}</p>
-
-                <div className="order-cake-visual" aria-label={`Cake tier illustration for ${order.orderId}`}>
-                  <div className="order-cake-stack" aria-hidden="true">
-                    {(() => {
-                      const count = getCardTierCount(order);
-                      const savedTiers =
-                        order.tierDetails && order.tierDetails.length > 0
-                          ? [...order.tierDetails].sort((a, b) => b.tierNumber - a.tierNumber)
-                          : Array.from({ length: count }, (_, idx) => ({
-                              tierNumber: count - idx,
-                              shape: '',
-                              priceUgx: 0,
-                            }));
-                      return savedTiers.map((t) => (
-                        <div
-                          key={t.tierNumber}
-                          className="mini-cylinder"
-                          style={{ width: `${getMiniCylinderWidth(t.tierNumber, count)}%` }}
-                        >
-                          <div className="mini-cylinder-top" />
-                          <div className="mini-cylinder-body" />
-                        </div>
-                      ));
-                    })()}
-                  </div>
-
-                  <div className="order-cake-meta">
-                    {order.tierDetails && order.tierDetails.length > 0 ? (
-                      <ul className="order-tier-list">
-                        {[...order.tierDetails]
-                          .sort((a, b) => b.tierNumber - a.tierNumber)
-                          .map((t) => (
-                            <li key={t.tierNumber}>
-                              <span>
-                                Tier {t.tierNumber}
-                                {t.shape ? ` (${t.shape})` : ''}
-                              </span>
-                              <strong>{formatUgx(t.priceUgx)}</strong>
-                            </li>
-                          ))}
-                      </ul>
-                    ) : (
-                      order.tiers && (
-                        <div className="order-meta-line">
-                          <span>Tiers:</span> <strong>{order.tiers}</strong>
-                        </div>
-                      )
-                    )}
-
-                    {(order.shape || order.size) && (
-                      <div className="order-meta-tags">
-                        {order.shape && (
-                          <span>
-                            Shape: <strong>{order.shape}</strong>
-                          </span>
-                        )}
-                        {order.size && (
-                          <span>
-                            Size: <strong>{order.size}</strong>
-                          </span>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <div className="money-grid">
-                  <div>
-                    <span className="money-label">Total</span>
-                    <strong className="money-val">{formatUgx(order.totalPriceUgx)}</strong>
-                  </div>
-                  <div>
-                    <span className="money-label">Paid</span>
-                    <strong className="money-val">{formatUgx(order.amountPaidUgx)}</strong>
-                  </div>
-                  <div>
-                    <span className="money-label">Balance</span>
-                    <strong
-                      className={`money-val ${
-                        order.balanceUgx === 0 ? 'balance-zero' : 'balance-due'
-                      }`}
-                    >
-                      {formatUgx(order.balanceUgx)}
-                    </strong>
-                  </div>
-                </div>
-
-                {!isDeleted && (
-                  <div className="order-card-actions">
-                    <button
-                      type="button"
-                      className="btn btn-secondary btn-sm"
-                      onClick={() => onEditOrder(order)}
-                    >
-                      View or Edit Order
-                    </button>
-                    <button
-                      type="button"
-                      className={`btn btn-sm ${isPickedUp ? 'btn-ghost' : 'btn-primary'}`}
-                      onClick={() => setPendingToggle({ order, nextStatus })}
-                    >
-                      {isPickedUp ? 'Mark Waiting Again' : 'Mark Picked Up'}
-                    </button>
-                    {onPrintReceipt && (
-                      <button
-                        type="button"
-                        className="btn btn-ghost btn-sm"
-                        onClick={() => onPrintReceipt(order)}
-                      >
-                        Print Receipt
-                      </button>
-                    )}
-                    {isAdmin && onDeleteOrder && (
-                      <button
-                        type="button"
-                        className="btn btn-danger btn-sm"
-                        onClick={() => setPendingDelete(order)}
-                      >
-                        Delete Order
-                      </button>
-                    )}
-                  </div>
+                ) : (
+                  <div className="orders-list">{pickedUpOrders.map(renderOrderCard)}</div>
                 )}
-              </article>
-            );
-          })}
+              </section>
+            </>
+          )}
         </div>
       )}
 
@@ -467,8 +572,10 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
             ? pendingToggle.nextStatus === 'picked_up'
               ? `Mark order ${pendingToggle.order.orderId} for ${pendingToggle.order.customerName} as Picked up?${
                   pendingToggle.order.balanceUgx > 0
-                    ? ` Outstanding balance: ${formatUgx(pendingToggle.order.balanceUgx)}.`
-                    : ''
+                    ? ` Outstanding balance of ${formatUgx(
+                        pendingToggle.order.balanceUgx
+                      )} will be recorded in today's collections (Kampala time).`
+                    : ' Pickup date and time will be recorded.'
                 }`
               : `Mark order ${pendingToggle.order.orderId} for ${pendingToggle.order.customerName} as Waiting for pickup again?`
             : ''
@@ -479,7 +586,21 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
         busy={toggling}
         onConfirm={handleConfirmToggle}
         onCancel={() => setPendingToggle(null)}
-      />
+      >
+        {pendingToggle?.nextStatus === 'picked_up' && pendingToggle.order.balanceUgx > 0 && (
+          <div className="field modal-field">
+            <label htmlFor="pickup-payment-method">Balance Payment Method *</label>
+            <select
+              id="pickup-payment-method"
+              value={pickupPaymentMethod}
+              onChange={(e) => setPickupPaymentMethod(e.target.value as PaymentMethod)}
+            >
+              <option value="cash">Cash</option>
+              <option value="mobile_money">Mobile Money</option>
+            </select>
+          </div>
+        )}
+      </ConfirmModal>
 
       <ConfirmModal
         open={Boolean(pendingDelete)}

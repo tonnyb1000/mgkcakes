@@ -8,6 +8,7 @@ interface ConfirmModalProps {
   cancelLabel?: string;
   danger?: boolean;
   busy?: boolean;
+  children?: React.ReactNode;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -20,6 +21,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
   cancelLabel = 'Cancel',
   danger = false,
   busy = false,
+  children,
   onConfirm,
   onCancel,
 }) => {
@@ -32,6 +34,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
           {title}
         </h2>
         <p className="modal-message">{message}</p>
+        {children}
         <div className="modal-actions">
           <button type="button" className="btn btn-secondary" onClick={onCancel} disabled={busy}>
             {cancelLabel}

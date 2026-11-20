@@ -3,6 +3,7 @@ import {
   getUnrecordedHistoricalAmount,
   summarizeDailyCashFlow,
   summarizeDailyCollections,
+  summarizeWalkInSales,
   validateCashFlowEntry,
   validateWalkInSale,
 } from '../utils/collections';
@@ -402,5 +403,66 @@ describe('Daily Collections & walk-in validation', () => {
     });
     expect(badCf.description).toBeDefined();
     expect(badCf.amountUgx).toBeDefined();
+  });
+
+  it('summarizes walk-in sales and daily collections with separate cash and mobile money totals', () => {
+    const payments = [
+      {
+        paymentId: 'PAY-1',
+        kind: 'order_deposit' as const,
+        paymentMethod: 'cash' as const,
+        orderId: 'ORD-1',
+        customerName: 'A',
+        description: 'Cake',
+        amountUgx: 50000,
+        receivedDate: '2026-11-20',
+        receivedTime: '09:00',
+        receivedAt: '2026-11-20T09:00:00+03:00',
+        recordedByUid: 'u1',
+        recordedByEmail: 's@shop.example',
+        recordedByName: 'Staff',
+      },
+      {
+        paymentId: 'PAY-2',
+        kind: 'walk_in' as const,
+        paymentMethod: 'cash' as const,
+        orderId: '',
+        customerName: 'Walk-in Customer',
+        description: 'Slice box',
+        amountUgx: 30000,
+        receivedDate: '2026-11-20',
+        receivedTime: '10:00',
+        receivedAt: '2026-11-20T10:00:00+03:00',
+        recordedByUid: 'u1',
+        recordedByEmail: 's@shop.example',
+        recordedByName: 'Staff',
+      },
+      {
+        paymentId: 'PAY-3',
+        kind: 'walk_in' as const,
+        paymentMethod: 'mobile_money' as const,
+        orderId: '',
+        customerName: 'Walk-in Customer',
+        description: 'Cupcakes',
+        amountUgx: 45000,
+        receivedDate: '2026-11-20',
+        receivedTime: '11:00',
+        receivedAt: '2026-11-20T11:00:00+03:00',
+        recordedByUid: 'u1',
+        recordedByEmail: 's@shop.example',
+        recordedByName: 'Staff',
+      },
+    ];
+
+    const walkIn = summarizeWalkInSales(payments, '2026-11-20');
+    expect(walkIn.cashUgx).toBe(30000);
+    expect(walkIn.mobileMoneyUgx).toBe(45000);
+    expect(walkIn.totalUgx).toBe(75000);
+    expect(walkIn.items).toHaveLength(2);
+
+    const daily = summarizeDailyCollections(payments, '2026-11-20');
+    expect(daily.cashUgx).toBe(80000);
+    expect(daily.mobileMoneyUgx).toBe(45000);
+    expect(daily.totalCollectedUgx).toBe(125000);
   });
 });

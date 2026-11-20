@@ -7,18 +7,14 @@ import type {
   PaymentMethod,
   PaymentTransaction,
   StaffUser,
-  WalkInSaleInput,
 } from '../types/order';
 import {
   generateCashFlowId,
-  generatePaymentId,
   getUnrecordedHistoricalAmount,
   summarizeDailyCashFlow,
   summarizeDailyCollections,
   validateCashFlowEntry,
-  validateWalkInSale,
   type CashFlowValidationErrors,
-  type WalkInValidationErrors,
 } from '../utils/collections';
 import { formatUgx } from '../utils/currency';
 import {
@@ -37,10 +33,7 @@ interface SalesCollectionsPageProps {
   loading: boolean;
   error: string | null;
   onRefresh: () => void;
-  onRecordWalkInSale: (
-    input: WalkInSaleInput,
-    idempotencyPaymentId: string
-  ) => Promise<void>;
+  onOpenWalkInSales?: () => void;
   onRecordCashFlowEntry: (
     input: CashFlowEntryInput,
     idempotencyEntryId: string
@@ -49,7 +42,7 @@ interface SalesCollectionsPageProps {
 
 function getPaymentKindLabel(kind: PaymentTransaction['kind']): string {
   if (kind === 'order_deposit') return 'Order Deposit';
-  if (kind === 'order_balance') return 'Later Order Payment';
+  if (kind === 'order_balance') return 'Order Balance';
   return 'Walk-in Sale';
 }
 
@@ -73,24 +66,13 @@ export const SalesCollectionsPage: React.FC<SalesCollectionsPageProps> = ({
   loading,
   error,
   onRefresh,
-  onRecordWalkInSale,
+  onOpenWalkInSales,
   onRecordCashFlowEntry,
 }) => {
   const todayKampala = getKampalaToday();
   const yesterdayKampala = addDaysToDateString(todayKampala, -1);
 
   const [selectedDate, setSelectedDate] = useState(todayKampala);
-
-  // Walk-in cake sale form state
-  const [description, setDescription] = useState('');
-  const [amountRaw, setAmountRaw] = useState('');
-  const [walkInMethod, setWalkInMethod] = useState<PaymentMethod>('cash');
-  const [saleDate, setSaleDate] = useState(todayKampala);
-  const [saleTime, setSaleTime] = useState(() => getKampalaTimeNow());
-  const [formErrors, setFormErrors] = useState<WalkInValidationErrors>({});
-  const [submitError, setSubmitError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const pendingSaleIdRef = useRef<string | null>(null);
 
   // Daily cash-flow (expenses & other item sales) form state
   const [cfType, setCfType] = useState<CashFlowEntryType>('expense');
@@ -124,44 +106,6 @@ export const SalesCollectionsPage: React.FC<SalesCollectionsPageProps> = ({
         .filter((entry) => entry.unrecordedUgx > 0),
     [orders, payments]
   );
-
-  const handleWalkInSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (saving) return;
-
-    setSubmitError(null);
-    const amountUgx = amountRaw === '' ? 0 : Number(amountRaw);
-    const input: WalkInSaleInput = {
-      description,
-      amountUgx: Number.isNaN(amountUgx) ? 0 : amountUgx,
-      paymentMethod: walkInMethod,
-      receivedDate: saleDate,
-      receivedTime: saleTime,
-    };
-
-    const validation = validateWalkInSale(input);
-    if (Object.keys(validation).length > 0) {
-      setFormErrors(validation);
-      return;
-    }
-
-    setSaving(true);
-    try {
-      if (!pendingSaleIdRef.current) {
-        pendingSaleIdRef.current = generatePaymentId(saleDate);
-      }
-      await onRecordWalkInSale(input, pendingSaleIdRef.current);
-      pendingSaleIdRef.current = null;
-      setDescription('');
-      setAmountRaw('');
-      setFormErrors({});
-      setSelectedDate(saleDate);
-    } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : 'Failed to record walk-in sale.');
-    } finally {
-      setSaving(false);
-    }
-  };
 
   const handleCashFlowSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -217,9 +161,20 @@ export const SalesCollectionsPage: React.FC<SalesCollectionsPageProps> = ({
               Collections shows cake money received only (not profit or a balance sheet).
             </p>
           </div>
-          <button type="button" className="btn btn-secondary btn-sm" onClick={onRefresh}>
-            Refresh
-          </button>
+          <div className="header-actions">
+            {onOpenWalkInSales && (
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                onClick={onOpenWalkInSales}
+              >
+                Walk-in Sales
+              </button>
+            )}
+            <button type="button" className="btn btn-secondary btn-sm" onClick={onRefresh}>
+              Refresh
+            </button>
+          </div>
         </div>
 
         <div className="collections-date-bar">
@@ -276,6 +231,14 @@ export const SalesCollectionsPage: React.FC<SalesCollectionsPageProps> = ({
             <div className="summary-tile">
               <span className="money-label">Walk-in Sales</span>
               <strong className="summary-value">{formatUgx(summary.walkInSalesUgx)}</strong>
+            </div>
+            <div className="summary-tile">
+              <span className="money-label">Cash Collected</span>
+              <strong className="summary-value">{formatUgx(summary.cashUgx)}</strong>
+            </div>
+            <div className="summary-tile">
+              <span className="money-label">Mobile Money Collected</span>
+              <strong className="summary-value">{formatUgx(summary.mobileMoneyUgx)}</strong>
             </div>
             <div className="summary-tile summary-tile-total">
               <span className="money-label">Total Collected</span>
@@ -494,151 +457,50 @@ export const SalesCollectionsPage: React.FC<SalesCollectionsPageProps> = ({
         </form>
 
         {cashFlowSummary.cashFlowItems.length > 0 && (
-          <div className="collections-list">
-            {cashFlowSummary.cashFlowItems.map((entry) => (
-              <div key={entry.entryId} className="collection-row">
-                <div className="collection-row-main">
-                  <div className="collection-row-top">
-                    <span className={`kind-badge kind-${entry.type}`}>
-                      {entry.type === 'expense' ? 'Money Out: Expense' : 'Money In: Other Sale'}
-                    </span>
-                    <span className="method-badge">
-                      {getPaymentMethodLabel(entry.paymentMethod)}
-                    </span>
-                    <span className="collection-time">{entry.entryTime}</span>
-                    <span className="order-id-badge">{entry.entryId}</span>
-                  </div>
-                  <div className="collection-row-desc">{entry.description}</div>
-                  <div className="collection-row-staff">
-                    Entered by {entry.recordedByName || entry.recordedByEmail} (
-                    {formatTimestampKampala(entry.createdAt)})
-                  </div>
-                </div>
-                <strong className="collection-amount">
-                  {entry.type === 'expense' ? '-' : '+'}
-                  {formatUgx(entry.amountUgx)}
-                </strong>
-              </div>
-            ))}
+          <div className="table-wrap">
+            <table className="spreadsheet-table" aria-label="Daily cash-flow table">
+              <thead>
+                <tr>
+                  <th scope="col">Date</th>
+                  <th scope="col">Time</th>
+                  <th scope="col">Type</th>
+                  <th scope="col">Description</th>
+                  <th scope="col">Payment Method</th>
+                  <th scope="col" className="num-col">
+                    Amount (UGX)
+                  </th>
+                  <th scope="col">Recorded By</th>
+                </tr>
+              </thead>
+              <tbody>
+                {cashFlowSummary.cashFlowItems.map((entry) => (
+                  <tr key={entry.entryId}>
+                    <td>{formatDateDisplay(entry.entryDate)}</td>
+                    <td>{entry.entryTime}</td>
+                    <td>
+                      <span className={`kind-badge kind-${entry.type}`}>
+                        {entry.type === 'expense' ? 'Money Out: Expense' : 'Money In: Other Sale'}
+                      </span>
+                    </td>
+                    <td>{entry.description}</td>
+                    <td>
+                      <span className="method-badge">
+                        {getPaymentMethodLabel(entry.paymentMethod)}
+                      </span>
+                    </td>
+                    <td className="num-col">
+                      <strong>
+                        {entry.type === 'expense' ? '-' : '+'}
+                        {formatUgx(entry.amountUgx)}
+                      </strong>
+                    </td>
+                    <td>{entry.recordedByName || entry.recordedByEmail}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
-      </div>
-
-      <div className="card">
-        <h3 className="section-title">Record Walk-in Cake Sale</h3>
-        <p className="muted-text">
-          For cakes sold without an existing order. Recorded under staff member:{' '}
-          <strong>{user.displayName}</strong>.
-        </p>
-
-        {submitError && (
-          <div className="notice notice-error" role="alert">
-            {submitError}
-          </div>
-        )}
-
-        <form onSubmit={handleWalkInSubmit} className="stack-md" noValidate>
-          <div className="grid-2">
-            <div className="field">
-              <label htmlFor="walkin-desc">Cake Description *</label>
-              <input
-                id="walkin-desc"
-                type="text"
-                value={description}
-                onChange={(e) => {
-                  setDescription(e.target.value);
-                  setFormErrors((prev) => ({ ...prev, description: undefined }));
-                  pendingSaleIdRef.current = null;
-                }}
-                placeholder="e.g. Vanilla slice box or counter cake"
-                aria-invalid={Boolean(formErrors.description)}
-                required
-              />
-              {formErrors.description && (
-                <span className="field-error">{formErrors.description}</span>
-              )}
-            </div>
-
-            <div className="field">
-              <label htmlFor="walkin-amount">Amount Received (UGX) *</label>
-              <input
-                id="walkin-amount"
-                type="number"
-                min={1}
-                step={500}
-                value={amountRaw}
-                onChange={(e) => {
-                  setAmountRaw(e.target.value);
-                  setFormErrors((prev) => ({ ...prev, amountUgx: undefined }));
-                  pendingSaleIdRef.current = null;
-                }}
-                placeholder="e.g. 35000"
-                aria-invalid={Boolean(formErrors.amountUgx)}
-                required
-              />
-              {formErrors.amountUgx && (
-                <span className="field-error">{formErrors.amountUgx}</span>
-              )}
-            </div>
-          </div>
-
-          <div className="grid-3">
-            <div className="field">
-              <label htmlFor="walkin-method">Payment Method *</label>
-              <select
-                id="walkin-method"
-                value={walkInMethod}
-                onChange={(e) => {
-                  setWalkInMethod(e.target.value as PaymentMethod);
-                  pendingSaleIdRef.current = null;
-                }}
-              >
-                <option value="cash">Cash</option>
-                <option value="mobile_money">Mobile Money</option>
-              </select>
-            </div>
-
-            <div className="field">
-              <label htmlFor="walkin-date">Date *</label>
-              <input
-                id="walkin-date"
-                type="date"
-                value={saleDate}
-                onChange={(e) => {
-                  setSaleDate(e.target.value);
-                  pendingSaleIdRef.current = null;
-                }}
-                required
-              />
-              {formErrors.receivedDate && (
-                <span className="field-error">{formErrors.receivedDate}</span>
-              )}
-            </div>
-
-            <div className="field">
-              <label htmlFor="walkin-time">Time *</label>
-              <input
-                id="walkin-time"
-                type="time"
-                value={saleTime}
-                onChange={(e) => {
-                  setSaleTime(e.target.value);
-                  pendingSaleIdRef.current = null;
-                }}
-                required
-              />
-              {formErrors.receivedTime && (
-                <span className="field-error">{formErrors.receivedTime}</span>
-              )}
-            </div>
-          </div>
-
-          <div className="form-actions">
-            <button type="submit" className="btn btn-primary" disabled={saving}>
-              {saving ? 'Recording…' : 'Record Walk-in Sale'}
-            </button>
-          </div>
-        </form>
       </div>
 
       <div className="card">
@@ -653,35 +515,82 @@ export const SalesCollectionsPage: React.FC<SalesCollectionsPageProps> = ({
             </p>
           </div>
         ) : (
-          <div className="collections-list">
-            {summary.items.map((item) => (
-              <div key={item.paymentId} className="collection-row">
-                <div className="collection-row-main">
-                  <div className="collection-row-top">
-                    <span className={`kind-badge kind-${item.kind}`}>
-                      {getPaymentKindLabel(item.kind)}
-                    </span>
-                    <span className="method-badge">
-                      {getPaymentMethodLabel(item.paymentMethod)}
-                    </span>
-                    <span className="collection-time">{item.receivedTime}</span>
-                    {item.orderId ? (
-                      <span className="order-id-badge">{item.orderId}</span>
-                    ) : (
-                      <span className="order-id-badge">Walk-in</span>
-                    )}
-                  </div>
-                  <div className="collection-row-desc">
-                    <strong>{item.orderId ? item.customerName : 'Walk-in Sale'}</strong> &middot;{' '}
-                    {item.description}
-                  </div>
-                  <div className="collection-row-staff">
-                    Recorded by {item.recordedByName || item.recordedByEmail} ({item.paymentId})
-                  </div>
-                </div>
-                <strong className="collection-amount">{formatUgx(item.amountUgx)}</strong>
-              </div>
-            ))}
+          <div className="table-wrap">
+            <table className="spreadsheet-table" aria-label="Itemised daily collections table">
+              <thead>
+                <tr>
+                  <th scope="col">Date</th>
+                  <th scope="col">Time</th>
+                  <th scope="col">Type</th>
+                  <th scope="col">Order / Ref</th>
+                  <th scope="col">Customer / Source</th>
+                  <th scope="col">Description</th>
+                  <th scope="col">Payment Method</th>
+                  <th scope="col" className="num-col">
+                    Amount (UGX)
+                  </th>
+                  <th scope="col">Recorded By</th>
+                </tr>
+              </thead>
+              <tbody>
+                {summary.items.map((item) => (
+                  <tr key={item.paymentId}>
+                    <td>{formatDateDisplay(item.receivedDate)}</td>
+                    <td>{item.receivedTime}</td>
+                    <td>
+                      <span className={`kind-badge kind-${item.kind}`}>
+                        {getPaymentKindLabel(item.kind)}
+                      </span>
+                    </td>
+                    <td>
+                      <span className="order-id-badge">{item.orderId || 'Walk-in'}</span>
+                    </td>
+                    <td>
+                      <strong>{item.orderId ? item.customerName : 'Walk-in Sale'}</strong>
+                    </td>
+                    <td>{item.description}</td>
+                    <td>
+                      <span className="method-badge">
+                        {getPaymentMethodLabel(item.paymentMethod)}
+                      </span>
+                    </td>
+                    <td className="num-col">
+                      <strong>{formatUgx(item.amountUgx)}</strong>
+                    </td>
+                    <td>{item.recordedByName || item.recordedByEmail}</td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr>
+                  <th scope="row" colSpan={7}>
+                    Cash Total
+                  </th>
+                  <td className="num-col">
+                    <strong>{formatUgx(summary.cashUgx)}</strong>
+                  </td>
+                  <td />
+                </tr>
+                <tr>
+                  <th scope="row" colSpan={7}>
+                    Mobile Money Total
+                  </th>
+                  <td className="num-col">
+                    <strong>{formatUgx(summary.mobileMoneyUgx)}</strong>
+                  </td>
+                  <td />
+                </tr>
+                <tr className="table-grand-total">
+                  <th scope="row" colSpan={7}>
+                    Total Collected
+                  </th>
+                  <td className="num-col">
+                    <strong>{formatUgx(summary.totalCollectedUgx)}</strong>
+                  </td>
+                  <td />
+                </tr>
+              </tfoot>
+            </table>
           </div>
         )}
 

@@ -43,6 +43,9 @@ export interface DailyCollectionsSummary {
   laterOrderPaymentsUgx: number;
   walkInSalesUgx: number;
   totalCollectedUgx: number;
+  cashUgx: number;
+  mobileMoneyUgx: number;
+  unspecifiedMethodUgx: number;
   items: PaymentTransaction[];
   excludedDeletedItems: Array<{
     payment: PaymentTransaction;
@@ -77,6 +80,9 @@ export function summarizeDailyCollections(
   let orderDepositsUgx = 0;
   let laterOrderPaymentsUgx = 0;
   let walkInSalesUgx = 0;
+  let cashUgx = 0;
+  let mobileMoneyUgx = 0;
+  let unspecifiedMethodUgx = 0;
 
   for (const item of allForDate) {
     const deletedOrder = item.orderId ? deletedOrderMap.get(item.orderId) : undefined;
@@ -93,6 +99,14 @@ export function summarizeDailyCollections(
     } else if (item.kind === 'walk_in') {
       walkInSalesUgx += item.amountUgx;
     }
+
+    if (item.paymentMethod === 'cash') {
+      cashUgx += item.amountUgx;
+    } else if (item.paymentMethod === 'mobile_money') {
+      mobileMoneyUgx += item.amountUgx;
+    } else {
+      unspecifiedMethodUgx += item.amountUgx;
+    }
   }
 
   return {
@@ -101,8 +115,58 @@ export function summarizeDailyCollections(
     laterOrderPaymentsUgx,
     walkInSalesUgx,
     totalCollectedUgx: orderDepositsUgx + laterOrderPaymentsUgx + walkInSalesUgx,
+    cashUgx,
+    mobileMoneyUgx,
+    unspecifiedMethodUgx,
     items,
     excludedDeletedItems,
+  };
+}
+
+export interface WalkInSalesSummary {
+  items: PaymentTransaction[];
+  cashUgx: number;
+  mobileMoneyUgx: number;
+  unspecifiedMethodUgx: number;
+  totalUgx: number;
+}
+
+export function summarizeWalkInSales(
+  payments: PaymentTransaction[],
+  date?: string
+): WalkInSalesSummary {
+  const items = payments
+    .filter((p) => p.kind === 'walk_in' && (!date || p.receivedDate === date))
+    .sort((a, b) => {
+      if (a.receivedDate !== b.receivedDate) {
+        return b.receivedDate.localeCompare(a.receivedDate);
+      }
+      if (a.receivedTime !== b.receivedTime) {
+        return b.receivedTime.localeCompare(a.receivedTime);
+      }
+      return b.receivedAt.localeCompare(a.receivedAt);
+    });
+
+  let cashUgx = 0;
+  let mobileMoneyUgx = 0;
+  let unspecifiedMethodUgx = 0;
+
+  for (const item of items) {
+    if (item.paymentMethod === 'cash') {
+      cashUgx += item.amountUgx;
+    } else if (item.paymentMethod === 'mobile_money') {
+      mobileMoneyUgx += item.amountUgx;
+    } else {
+      unspecifiedMethodUgx += item.amountUgx;
+    }
+  }
+
+  return {
+    items,
+    cashUgx,
+    mobileMoneyUgx,
+    unspecifiedMethodUgx,
+    totalUgx: cashUgx + mobileMoneyUgx + unspecifiedMethodUgx,
   };
 }
 

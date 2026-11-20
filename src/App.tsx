@@ -8,7 +8,9 @@ import { OrderForm } from './components/OrderForm';
 import { OrdersPage } from './components/OrdersPage';
 import { ReceiptView } from './components/ReceiptView';
 import { SalesCollectionsPage } from './components/SalesCollectionsPage';
+import { WalkInSalesPage } from './components/WalkInSalesPage';
 import { createOrderRepository, type OrderRepository } from './services/orderRepository';
+import { formatUgx } from './utils/currency';
 import type {
   CakeOrder,
   CakeOrderInput,
@@ -242,13 +244,29 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
     );
   };
 
-  const handleTogglePickupStatus = async (order: CakeOrder, nextStatus: PickupStatus) => {
-    const updated = await repo.updatePickupStatus(order.orderId, nextStatus, user);
+  const handleTogglePickupStatus = async (
+    order: CakeOrder,
+    nextStatus: PickupStatus,
+    options?: { paymentMethod?: PaymentMethod; idempotencyPaymentId?: string }
+  ) => {
+    const { order: updated, payment } = await repo.updatePickupStatus(
+      order.orderId,
+      nextStatus,
+      user,
+      options
+    );
     setOrders((prev) => prev.map((o) => (o.orderId === order.orderId ? updated : o)));
+    if (payment) {
+      setPayments((prev) =>
+        prev.some((p) => p.paymentId === payment.paymentId) ? prev : [payment, ...prev]
+      );
+    }
     setBannerMessage(
-      `Order ${updated.orderId} marked as ${
-        updated.pickupStatus === 'picked_up' ? 'Picked up' : 'Waiting for pickup'
-      }.`
+      updated.pickupStatus === 'picked_up'
+        ? payment
+          ? `Order ${updated.orderId} marked as Picked up. Balance payment of ${formatUgx(payment.amountUgx)} recorded.`
+          : `Order ${updated.orderId} marked as Picked up.`
+        : `Order ${updated.orderId} marked as Waiting for pickup.`
     );
   };
 
@@ -387,6 +405,15 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
               }}
               onCancel={() => handleTabChange('orders')}
             />
+          ) : activeTab === 'walkin' ? (
+            <WalkInSalesPage
+              payments={payments}
+              user={user}
+              loading={dataLoading}
+              error={dataError}
+              onRefresh={loadData}
+              onRecordWalkInSale={handleRecordWalkInSale}
+            />
           ) : activeTab === 'collections' ? (
             <SalesCollectionsPage
               orders={orders}
@@ -396,7 +423,7 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
               loading={dataLoading}
               error={dataError}
               onRefresh={loadData}
-              onRecordWalkInSale={handleRecordWalkInSale}
+              onOpenWalkInSales={() => handleTabChange('walkin')}
               onRecordCashFlowEntry={handleRecordCashFlowEntry}
             />
           ) : activeTab === 'archive' ? (
@@ -457,19 +484,28 @@ export const App: React.FC<AppProps> = ({ repository: injectedRepo }) => {
               <div className="card">
                 <div className="owner-tools-row">
                   <div>
-                    <h3 className="owner-tools-title">Sales &amp; Daily Collections</h3>
+                    <h3 className="owner-tools-title">Walk-in Sales &amp; Daily Collections</h3>
                     <p className="help-text">
-                      Record walk-in cake sales and view money received today (deposits, balance
-                      payments, and walk-ins).
+                      Record counter walk-in cake sales and view money received today (deposits,
+                      balance payments, and walk-ins).
                     </p>
                   </div>
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-sm"
-                    onClick={() => handleTabChange('collections')}
-                  >
-                    Daily Collections
-                  </button>
+                  <div className="header-actions">
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => handleTabChange('walkin')}
+                    >
+                      Walk-in Sales
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => handleTabChange('collections')}
+                    >
+                      Daily Collections
+                    </button>
+                  </div>
                 </div>
               </div>
 

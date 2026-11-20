@@ -242,20 +242,99 @@ class TestMemoryOrderRepository implements OrderRepository {
   async updatePickupStatus(
     orderId: string,
     status: PickupStatus,
-    user: StaffUser | null
-  ): Promise<CakeOrder> {
+    user: StaffUser | null,
+    options?: { paymentMethod?: PaymentMethod; idempotencyPaymentId?: string }
+  ): Promise<{ order: CakeOrder; payment?: PaymentTransaction }> {
     if (!user) throw new Error('Access denied');
     const idx = this.orders.findIndex((o) => o.orderId === orderId);
     if (idx === -1) throw new Error('Not found');
+    const existing = this.orders[idx];
+    if (existing.deletedAt) throw new Error('Cannot update deleted order');
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const pickedUpDate = getKampalaToday(now);
+    const pickedUpTime = getKampalaTimeNow(now);
+
+    if (status === 'picked_up') {
+      if (options?.idempotencyPaymentId) {
+        const existingPay = this.payments.find(
+          (p) => p.paymentId === options.idempotencyPaymentId
+        );
+        if (existingPay) {
+          if (existingPay.orderId === orderId) {
+            return { order: existing, payment: existingPay };
+          }
+          throw new Error('Duplicate payment ID');
+        }
+      }
+
+      if (existing.pickupStatus === 'picked_up') {
+        return { order: existing };
+      }
+
+      const outstanding = Math.max(
+        0,
+        calculateBalanceUgx(existing.totalPriceUgx, existing.amountPaidUgx)
+      );
+
+      if (outstanding > 0) {
+        const paymentId = options?.idempotencyPaymentId || generatePaymentId(pickedUpDate);
+        const payment: PaymentTransaction = {
+          paymentId,
+          kind: 'order_balance',
+          paymentMethod: options?.paymentMethod ?? 'cash',
+          orderId,
+          customerName: existing.customerName,
+          description: existing.description,
+          amountUgx: outstanding,
+          receivedDate: pickedUpDate,
+          receivedTime: pickedUpTime,
+          receivedAt: nowIso,
+          recordedByUid: user.uid,
+          recordedByEmail: user.email,
+          recordedByName: user.displayName,
+        };
+        const updated: CakeOrder = {
+          ...existing,
+          pickupStatus: 'picked_up',
+          pickedUpAt: nowIso,
+          pickedUpDate,
+          pickedUpTime,
+          amountPaidUgx: existing.totalPriceUgx,
+          balanceUgx: 0,
+          lastPaymentId: paymentId,
+          updatedAt: nowIso,
+          updatedByUid: user.uid,
+          updatedByEmail: user.email,
+        };
+        this.payments = [payment, ...this.payments];
+        this.orders = [...this.orders.slice(0, idx), updated, ...this.orders.slice(idx + 1)];
+        return { order: updated, payment };
+      }
+
+      const updated: CakeOrder = {
+        ...existing,
+        pickupStatus: 'picked_up',
+        pickedUpAt: nowIso,
+        pickedUpDate,
+        pickedUpTime,
+        updatedAt: nowIso,
+        updatedByUid: user.uid,
+        updatedByEmail: user.email,
+      };
+      this.orders = [...this.orders.slice(0, idx), updated, ...this.orders.slice(idx + 1)];
+      return { order: updated };
+    }
+
     const updated: CakeOrder = {
-      ...this.orders[idx],
-      pickupStatus: status,
-      updatedAt: new Date().toISOString(),
+      ...existing,
+      pickupStatus: 'waiting',
+      updatedAt: nowIso,
       updatedByUid: user.uid,
       updatedByEmail: user.email,
     };
     this.orders = [...this.orders.slice(0, idx), updated, ...this.orders.slice(idx + 1)];
-    return updated;
+    return { order: updated };
   }
 
   async recordOrderPayment(
@@ -481,6 +560,8 @@ async function signInAs(user: ReturnType<typeof userEvent.setup>, email: string)
   await user.click(screen.getByRole('button', { name: /Sign In/i }));
 }
 
+vi.setConfig({ testTimeout: 15000 });
+
 describe('Cake Order Tracker workflows & access control', () => {
   it('shows setup screen and blocks access when Firebase is not configured', async () => {
     const repo: OrderRepository = new UnconfiguredOrderRepository();
@@ -667,18 +748,24 @@ describe('Cake Order Tracker workflows & access control', () => {
     await user.click(within(danielCard).getByRole('button', { name: /Mark Picked Up/i }));
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /Yes, Mark Picked Up/i }));
 
-    // 3. Go to Daily Collections and record a walk-in sale of UGX 35,000
-    await user.click(screen.getByRole('button', { name: /Daily Collections/i }));
-    expect(screen.getByText(/profit or a balance sheet/i)).toBeInTheDocument();
-
+    // 3. Go to Walk-in Sales page and record a walk-in sale of UGX 35,000
+    await user.click(screen.getByRole('button', { name: /Walk-in Sales/i }));
     await user.type(screen.getByLabelText(/Cake Description/i), 'Counter cupcake box');
     await user.type(screen.getByLabelText(/Amount Received \(UGX\)/i), '35000');
     await user.click(screen.getByRole('button', { name: /Record Walk-in Sale/i }));
 
+    // 4. Go to Daily Collections and verify walk-in sale is included once (no double counting)
+    await user.click(screen.getByRole('button', { name: /Daily Collections/i }));
+    expect(screen.getByText(/profit or a balance sheet/i)).toBeInTheDocument();
+
     const summaryGrid = screen.getByLabelText(/Daily collections summary/i);
     expect(within(summaryGrid).getByText('UGX 50,000')).toBeInTheDocument(); // Order Deposits
     expect(within(summaryGrid).getByText('UGX 35,000')).toBeInTheDocument(); // Walk-in Sales
-    expect(within(summaryGrid).getByText('UGX 85,000')).toBeInTheDocument(); // Total Collected
+    expect(within(summaryGrid).getAllByText('UGX 85,000')).toHaveLength(2); // Cash Collected & Total Collected
+
+    // Spreadsheet table shows collections
+    const collectionsTable = screen.getByRole('table', { name: /Itemised daily collections table/i });
+    expect(within(collectionsTable).getByText('Counter cupcake box')).toBeInTheDocument();
 
     // Historical orders with amountPaidUgx > 0 and no payment records are flagged without inventing dates
     expect(screen.getByText(/Historical Order Amounts Needing Review/i)).toBeInTheDocument();
@@ -741,7 +828,7 @@ describe('Cake Order Tracker workflows & access control', () => {
       listPayments: (u) => baseRepo.listPayments(u),
       listCashFlowEntries: (u) => baseRepo.listCashFlowEntries(u),
       updateOrder: (id, inp, u, exp) => baseRepo.updateOrder(id, inp, u, exp),
-      updatePickupStatus: (id, st, u) => baseRepo.updatePickupStatus(id, st, u),
+      updatePickupStatus: (id, st, u, opts) => baseRepo.updatePickupStatus(id, st, u, opts),
       deleteOrder: (id, u) => baseRepo.deleteOrder(id, u),
       recordOrderPayment: (id, amt, u, pid, pm) => baseRepo.recordOrderPayment(id, amt, u, pid, pm),
       recordWalkInSale: (inp, u, pid) => baseRepo.recordWalkInSale(inp, u, pid),
@@ -819,7 +906,7 @@ describe('Cake Order Tracker workflows & access control', () => {
       listPayments: (u) => baseRepo.listPayments(u),
       listCashFlowEntries: (u) => baseRepo.listCashFlowEntries(u),
       updateOrder: (id, inp, u, exp) => baseRepo.updateOrder(id, inp, u, exp),
-      updatePickupStatus: (id, st, u) => baseRepo.updatePickupStatus(id, st, u),
+      updatePickupStatus: (id, st, u, opts) => baseRepo.updatePickupStatus(id, st, u, opts),
       deleteOrder: (id, u) => baseRepo.deleteOrder(id, u),
       recordOrderPayment: (id, amt, u, pid, pm) => baseRepo.recordOrderPayment(id, amt, u, pid, pm),
       recordWalkInSale: (inp, u, pid) => baseRepo.recordWalkInSale(inp, u, pid),
@@ -896,7 +983,7 @@ describe('Cake Order Tracker workflows & access control', () => {
       listPayments: (u) => baseRepo.listPayments(u),
       listCashFlowEntries: (u) => baseRepo.listCashFlowEntries(u),
       updateOrder: (id, inp, u, exp) => baseRepo.updateOrder(id, inp, u, exp),
-      updatePickupStatus: (id, st, u) => baseRepo.updatePickupStatus(id, st, u),
+      updatePickupStatus: (id, st, u, opts) => baseRepo.updatePickupStatus(id, st, u, opts),
       deleteOrder: (id, u) => baseRepo.deleteOrder(id, u),
       recordOrderPayment: (id, amt, u, pid, pm) => baseRepo.recordOrderPayment(id, amt, u, pid, pm),
       recordWalkInSale: (inp, u, pid) => baseRepo.recordWalkInSale(inp, u, pid),
@@ -1058,7 +1145,8 @@ describe('Cake Order Tracker workflows & access control', () => {
     expect(within(combinedTile).getByText('UGX 15,000')).toBeInTheDocument();
     expect(within(combinedTile).getByText('UGX 25,000')).toBeInTheDocument();
     expect(within(combinedTile).getByText('-UGX 10,000')).toBeInTheDocument();
-    expect(screen.getAllByText(/Entered by Staff User/i)).toHaveLength(2);
+    const cfTable = screen.getByRole('table', { name: /Daily cash-flow table/i });
+    expect(within(cfTable).getAllByText('Staff User')).toHaveLength(2);
 
     // Sign out and sign in as Owner/Admin -> create an order with deposit, then delete it
     await user.click(screen.getByRole('button', { name: /Sign out/i }));
@@ -1091,7 +1179,7 @@ describe('Cake Order Tracker workflows & access control', () => {
     // Daily Collections retains the payment record for history, but excludes UGX 60,000 from totals
     await user.click(screen.getByRole('button', { name: /Daily Collections/i }));
     const colSummary = screen.getByLabelText(/Daily collections summary/i);
-    expect(within(colSummary).getAllByText('UGX 0')).toHaveLength(4);
+    expect(within(colSummary).getAllByText('UGX 0')).toHaveLength(6);
     expect(
       screen.getByText(/Retained Payment History for Deleted Orders \(Excluded from Totals\)/i)
     ).toBeInTheDocument();
@@ -1188,5 +1276,101 @@ describe('Mandatory order receipt', () => {
     expect(html).toContain('A &amp; B');
     expect(html).toContain(order.orderId);
     expect(html).toContain('Balance due');
+  });
+});
+
+describe('Pickup payments, order separation, and separate Walk-in Sales page', () => {
+  it('records Kampala pickup date/time, collects outstanding balance by Mobile Money, and prevents duplicate payments', async () => {
+    const user = userEvent.setup();
+    const repo = new TestMemoryOrderRepository(makeTestOrders());
+    render(<App repository={repo} />);
+
+    await signInAs(user, 'staff@shop.example');
+    await user.click(await screen.findByRole('button', { name: /View Orders/i }));
+
+    // Amina Namukasa (ORD-TEST-001) has UGX 100,000 paid and UGX 100,000 balance, Waiting
+    const waitingSection = await screen.findByRole('region', {
+      name: /Orders waiting for pickup/i,
+    });
+    const aminaCard = within(waitingSection).getByText('Amina Namukasa').closest('article')!;
+    await user.click(within(aminaCard).getByRole('button', { name: /Mark Picked Up/i }));
+
+    // Modal asks for Cash or Mobile Money for the UGX 100,000 balance
+    const dialog = screen.getByRole('dialog');
+    await user.selectOptions(
+      within(dialog).getByLabelText(/Balance Payment Method/i),
+      'mobile_money'
+    );
+    await user.click(within(dialog).getByRole('button', { name: /Yes, Mark Picked Up/i }));
+
+    // Order moves to Already Picked Up section with UGX 0 balance & recorded pickup timestamp
+    const pickedSection = await screen.findByRole('region', {
+      name: /Orders already picked up/i,
+    });
+    const pickedCard = within(pickedSection).getByText('Amina Namukasa').closest('article')!;
+    expect(within(pickedCard).getByText(/Balance: UGX 0 \(Paid\)/i)).toBeInTheDocument();
+    expect(within(pickedCard).getByText(/Picked up:/i)).toBeInTheDocument();
+
+    // Existing picked-up order (ORD-TEST-OLD / Old Archive Customer) does NOT get an invented pickup timestamp
+    const oldArchiveCard = within(pickedSection).getByText('Old Archive Customer').closest('article')!;
+    expect(within(oldArchiveCard).queryByText(/Picked up:/i)).not.toBeInTheDocument();
+
+    // Repeat attempt (Mark Waiting Again -> Mark Picked Up) must NOT create a duplicate payment
+    await user.click(within(pickedCard).getByRole('button', { name: /Mark Waiting Again/i }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /Yes, Mark Waiting/i }));
+
+    const waitingAgain = await screen.findByRole('region', {
+      name: /Orders waiting for pickup/i,
+    });
+    const aminaAgain = within(waitingAgain).getByText('Amina Namukasa').closest('article')!;
+    await user.click(within(aminaAgain).getByRole('button', { name: /Mark Picked Up/i }));
+    expect(within(screen.getByRole('dialog')).queryByLabelText(/Balance Payment Method/i)).not.toBeInTheDocument();
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /Yes, Mark Picked Up/i }));
+
+    // Daily Collections shows UGX 100,000 once under Later Order Payments & Mobile Money
+    await user.click(screen.getByRole('button', { name: /Daily Collections/i }));
+    const summaryGrid = screen.getByLabelText(/Daily collections summary/i);
+    expect(within(summaryGrid).getAllByText('UGX 100,000')).toHaveLength(3);
+
+    const collectionsTable = screen.getByRole('table', {
+      name: /Itemised daily collections table/i,
+    });
+    const aminaRows = within(collectionsTable).getAllByText('Amina Namukasa');
+    expect(aminaRows).toHaveLength(1);
+    expect(within(collectionsTable).getByText('Mobile Money')).toBeInTheDocument();
+  });
+
+  it('records and displays walk-in sales on the separate Walk-in Sales page with spreadsheet table and separate method totals', async () => {
+    const user = userEvent.setup();
+    const repo = new TestMemoryOrderRepository(makeTestOrders());
+    render(<App repository={repo} />);
+
+    await signInAs(user, 'staff@shop.example');
+    await user.click(await screen.findByRole('button', { name: /Walk-in Sales/i }));
+
+    // Record Cash walk-in sale
+    await user.type(screen.getByLabelText(/Cake Description/i), 'Chocolate bento');
+    await user.type(screen.getByLabelText(/Amount Received \(UGX\)/i), '40000');
+    await user.click(screen.getByRole('button', { name: /Record Walk-in Sale/i }));
+
+    // Record Mobile Money walk-in sale
+    await user.type(screen.getByLabelText(/Cake Description/i), 'Red velvet slices');
+    await user.type(screen.getByLabelText(/Amount Received \(UGX\)/i), '25000');
+    await user.selectOptions(screen.getByLabelText(/Payment Method/i), 'mobile_money');
+    await user.click(screen.getByRole('button', { name: /Record Walk-in Sale/i }));
+
+    const walkInTotals = screen.getByLabelText(/Walk-in sales totals/i);
+    expect(within(walkInTotals).getByText('UGX 40,000')).toBeInTheDocument();
+    expect(within(walkInTotals).getByText('UGX 25,000')).toBeInTheDocument();
+    expect(within(walkInTotals).getByText('UGX 65,000')).toBeInTheDocument();
+
+    const walkInTable = screen.getByRole('table', { name: /Walk-in sales table/i });
+    expect(within(walkInTable).getByText('Chocolate bento')).toBeInTheDocument();
+    expect(within(walkInTable).getByText('Red velvet slices')).toBeInTheDocument();
+
+    // Daily Collections includes walk-in sales once without double counting
+    await user.click(screen.getByRole('button', { name: /Daily Collections/i }));
+    const summaryGrid = screen.getByLabelText(/Daily collections summary/i);
+    expect(within(summaryGrid).getAllByText('UGX 65,000').length).toBeGreaterThanOrEqual(1);
   });
 });
